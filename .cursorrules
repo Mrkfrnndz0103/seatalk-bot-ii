@@ -1,0 +1,39 @@
+You are editing an existing Node.js (CommonJS) SeaTalk bot repository.
+
+# Non-negotiable constraints
+- Do not rewrite or restructure index.js. Only minimal wiring edits are allowed.
+- Do not move files into a new src/ tree. Keep existing layout; add new folders alongside index.js.
+- Keep CommonJS require/module.exports (no ESM conversion).
+- Do not change existing webhook routes, request parsing, or signature verification logic.
+- Do not hardcode secrets. Use environment variables. Never commit .env.
+- Add new code in new modules/folders; touch existing files only when necessary to wire things up.
+
+# Target feature
+Add Google Drive/Sheets indexing + retrieval so the bot can answer questions from all Google Sheets in a Drive folder.
+
+# Required modules/folders to add
+clients/: drive.client.js, sheets.client.js
+indexing/: schema.js, chunker.js, indexer.js
+store/: index.store.js, file.store.js
+retrieval/: ranker.js, retriever.js
+commands/: index.js, help.command.js, search.command.js, reindex.command.js
+utils/: a1.js, text.js, logger.js
+data/: runtime output only (gitignored)
+
+# Range detection (must follow)
+- Do not assume A:Z.
+- Use Sheets API spreadsheets.get to read gridProperties.rowCount/columnCount per tab.
+- Cap scan with MAX_ROWS_TO_SCAN and MAX_COLS_TO_SCAN.
+- Read scan range A1, then trim empty trailing rows/columns in memory.
+- Compute final used rangeA1.
+
+# Bot behavior
+- Commands: help, reindex, search <query>
+- Non-command: retrieve across chunks and answer
+- If index empty: instruct user to run reindex
+- Replies include sources: Spreadsheet > Tab > A1 range
+
+# Work style
+- Make small, reviewable diffs.
+- After changes: summarize files changed and why.
+- Avoid adding dependencies unless necessary.

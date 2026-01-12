@@ -7,8 +7,15 @@ const path = require("path");
 const { google } = require("googleapis");
 require("dotenv").config();
 
+const env = require("./config/env");
+const { FileStore } = require("./store/file.store");
+const commands = require("./commands");
+
 const app = express();
 app.use(express.json());
+
+const indexStore = new FileStore({ path: env.INDEX_STORE_PATH });
+indexStore.load();
 
 // ======================
 // Your bot settings
@@ -1038,6 +1045,30 @@ async function handleSubscriberMessage(event) {
       employee_code,
       "I can only read text messages right now."
     );
+    return;
+  }
+
+  const commandReply = await commands.handle(msgText, { store: indexStore });
+  if (commandReply && commandReply.text) {
+    await replyToSubscriber(employee_code, commandReply.text);
+    return;
+  }
+
+  const loadedIndex = indexStore.load();
+  if (!loadedIndex.length) {
+    await replyToSubscriber(
+      employee_code,
+      "Index is empty. Run /reindex to build it."
+    );
+    return;
+  }
+
+  const searchReply = await commands.handle(`/search ${msgText}`, {
+    store: indexStore,
+    topK: 3
+  });
+  if (searchReply && searchReply.text) {
+    await replyToSubscriber(employee_code, searchReply.text);
     return;
   }
 

@@ -1,0 +1,1233 @@
+// index.js
+const express = require("express");
+const crypto = require("crypto");
+const axios = require("axios");
+const fs = require("fs");
+const path = require("path");
+const { google } = require("googleapis");
+require("dotenv").config();
+
+const app = express();
+app.use(express.json());
+
+// ======================
+// Your bot settings
+// ======================
+const SIGNING_SECRET = process.env.SIGNING_SECRET;
+const STATIC_BOT_ACCESS_TOKEN = process.env.BOT_ACCESS_TOKEN;
+const SEATALK_API_BASE_URL =
+  process.env.SEATALK_API_BASE_URL || "https://openapi.seatalk.io";
+const SEATALK_TOKEN_URL = process.env.SEATALK_TOKEN_URL;
+const SEATALK_APP_ID = process.env.SEATALK_APP_ID;
+const SEATALK_APP_SECRET = process.env.SEATALK_APP_SECRET;
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
+const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL;
+const RAW_OPENROUTER_API_BASE_URL = process.env.OPENROUTER_API_BASE_URL;
+const OPENROUTER_API_BASE_URL =
+  normalizeOpenRouterBaseUrl(RAW_OPENROUTER_API_BASE_URL) ||
+  "https://openrouter.ai/api/v1";
+const OPENROUTER_APP_URL = process.env.OPENROUTER_APP_URL || "";
+const OPENROUTER_APP_TITLE = process.env.OPENROUTER_APP_TITLE || "";
+const BOT_NAME = process.env.BOT_NAME || "OB Bot";
+const SEATALK_PROFILE_URL = process.env.SEATALK_PROFILE_URL || "";
+const SEATALK_PROFILE_METHOD = String(
+  process.env.SEATALK_PROFILE_METHOD || "post"
+).toLowerCase();
+const SEATALK_PROFILE_CACHE_MINUTES = Number(
+  process.env.SEATALK_PROFILE_CACHE_MINUTES || 720
+);
+const SHEETS_FILE = process.env.SHEETS_FILE
+  ? path.resolve(process.env.SHEETS_FILE)
+  : path.join(__dirname, "sheets.txt");
+const GOOGLE_SERVICE_ACCOUNT_FILE = process.env.GOOGLE_SERVICE_ACCOUNT_FILE
+  ? path.resolve(process.env.GOOGLE_SERVICE_ACCOUNT_FILE)
+  : null;
+const GOOGLE_OAUTH_CLIENT_ID = process.env.GOOGLE_OAUTH_CLIENT_ID;
+const GOOGLE_OAUTH_CLIENT_SECRET = process.env.GOOGLE_OAUTH_CLIENT_SECRET;
+const GOOGLE_OAUTH_REDIRECT_URL = process.env.GOOGLE_OAUTH_REDIRECT_URL;
+const GOOGLE_OAUTH_TOKEN_FILE = process.env.GOOGLE_OAUTH_TOKEN_FILE
+  ? path.resolve(process.env.GOOGLE_OAUTH_TOKEN_FILE)
+  : path.join(__dirname, "google-token.json");
+const GOOGLE_SHEETS_SCOPES = (process.env.GOOGLE_SHEETS_SCOPES ||
+  "https://www.googleapis.com/auth/spreadsheets.readonly")
+  .split(",")
+  .map((scope) => scope.trim())
+  .filter(Boolean);
+const SHEETS_DEFAULT_RANGE = process.env.SHEETS_DEFAULT_RANGE || "";
+const SHEETS_SCAN_ALL_TABS =
+  String(process.env.SHEETS_SCAN_ALL_TABS || "").toLowerCase() === "true";
+const SHEETS_MAX_TABS = Number(process.env.SHEETS_MAX_TABS || 10);
+const SHEETS_REFRESH_MINUTES = Number(
+  process.env.SHEETS_REFRESH_MINUTES || 15
+);
+const SHEETS_MAX_MATCH_LINES = Number(
+  process.env.SHEETS_MAX_MATCH_LINES || 8
+);
+const SHEETS_MAX_CONTEXT_CHARS = Number(
+  process.env.SHEETS_MAX_CONTEXT_CHARS || 3000
+);
+
+// ======================
+// Event types
+// ======================
+const EVENT_VERIFICATION = "event_verification";
+const NEW_BOT_SUBSCRIBER = "new_bot_subscriber";
+const MESSAGE_FROM_BOT_SUBSCRIBER = "message_from_bot_subscriber";
+const INTERACTIVE_MESSAGE_CLICK = "interactive_message_click";
+const BOT_ADDED_TO_GROUP_CHAT = "bot_added_to_group_chat";
+const BOT_REMOVED_FROM_GROUP_CHAT = "bot_removed_from_group_chat";
+const NEW_MENTIONED_MESSAGE_RECEIVED_FROM_GROUP_CHAT = "new_mentioned_message_received_from_group_chat";
+
+// ======================
+// Helpers
+// ======================
+
+// Verify signature
+function isValidSignature(body, signature) {
+  if (!SIGNING_SECRET) {
+    return false;
+  }
+
+  const hash = crypto
+    .createHash("sha256")
+    .update(Buffer.concat([Buffer.from(body), Buffer.from(SIGNING_SECRET)]))
+    .digest("hex");
+  return hash === signature;
+}
+
+const TOKEN_REFRESH_BUFFER_MS = 60 * 1000;
+const TOKEN_FALLBACK_TTL_MS = 2 * 60 * 60 * 1000;
+let cachedAccessToken = null;
+let accessTokenExpiresAtMs = 0;
+let refreshPromise = null;
+
+function hasTokenCredentials() {
+  return Boolean(SEATALK_TOKEN_URL && SEATALK_APP_ID && SEATALK_APP_SECRET);
+}
+
+async function requestAccessToken() {
+  const response = await axios.post(SEATALK_TOKEN_URL, {
+    // Adjust keys to match the Seatalk token endpoint requirements.
+    app_id: SEATALK_APP_ID,
+    app_secret: SEATALK_APP_SECRET
+  });
+
+  const payload = response.data?.data || response.data;
+  const token = payload?.access_token || payload?.app_access_token;
+  const expiresIn = Number(
+    payload?.expires_in ?? payload?.expire_in ?? payload?.expires ?? 0
+  );
+
+  if (!token) {
+    throw new Error("Token endpoint response missing access token.");
+  }
+
+  cachedAccessToken = token;
+  accessTokenExpiresAtMs =
+    Date.now() + (expiresIn > 0 ? expiresIn * 1000 : TOKEN_FALLBACK_TTL_MS);
+  return cachedAccessToken;
+}
+
+async function getAccessToken(options = {}) {
+  const forceRefresh = Boolean(options.forceRefresh);
+
+  if (!hasTokenCredentials()) {
+    if (!STATIC_BOT_ACCESS_TOKEN) {
+      throw new Error(
+        "Missing BOT_ACCESS_TOKEN or Seatalk app credentials for refresh."
+      );
+    }
+    return STATIC_BOT_ACCESS_TOKEN;
+  }
+
+  const now = Date.now();
+  const isFresh =
+    cachedAccessToken &&
+    now < accessTokenExpiresAtMs - TOKEN_REFRESH_BUFFER_MS;
+
+  if (!forceRefresh && isFresh) {
+    return cachedAccessToken;
+  }
+
+  if (!refreshPromise) {
+    refreshPromise = requestAccessToken().finally(() => {
+      refreshPromise = null;
+    });
+  }
+
+  return refreshPromise;
+}
+
+function isUnauthorized(error) {
+  return (
+    error.response?.status === 401 || error.response?.data?.code === 401
+  );
+}
+
+async function requestWithAuth(method, url, payload) {
+  const token = await getAccessToken();
+  const normalizedMethod = String(method || "post").toLowerCase();
+  const config = {
+    method: normalizedMethod,
+    url,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json"
+    }
+  };
+
+  if (normalizedMethod === "get") {
+    config.params = payload;
+  } else {
+    config.data = payload;
+  }
+
+  try {
+    return await axios(config);
+  } catch (error) {
+    if (hasTokenCredentials() && isUnauthorized(error)) {
+      const refreshedToken = await getAccessToken({ forceRefresh: true });
+      config.headers.Authorization = `Bearer ${refreshedToken}`;
+      return await axios(config);
+    }
+    throw error;
+  }
+}
+
+async function postWithAuth(url, payload) {
+  return requestWithAuth("post", url, payload);
+}
+
+const TAB_MATCH_MIN_SCORE = 0.65;
+const TAB_SUGGEST_MIN_SCORE = 0.4;
+const TAB_SUGGEST_LIMIT = 3;
+const TAB_STOPWORDS = new Set([
+  "tab",
+  "shift",
+  "schedule",
+  "the",
+  "and",
+  "for",
+  "are",
+  "with",
+  "that",
+  "this",
+  "from",
+  "your",
+  "you",
+  "about",
+  "what",
+  "when",
+  "where",
+  "which",
+  "who",
+  "how",
+  "can",
+  "could",
+  "would",
+  "should",
+  "please",
+  "thanks",
+  "hello",
+  "hi",
+  "hey"
+]);
+
+function normalizeOpenRouterBaseUrl(value) {
+  if (!value) {
+    return "";
+  }
+
+  return String(value).trim().replace(/\/+$/, "");
+}
+
+function normalizeText(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/\b(a\.m\.|am)\b/g, "am")
+    .replace(/\b(p\.m\.|pm)\b/g, "pm")
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function extractTimes(value) {
+  const matches = [];
+  const regex = /(\d{1,2})(?::\d{2})?\s*(am|pm)/gi;
+  let match;
+  while ((match = regex.exec(String(value || "")))) {
+    matches.push(`${match[1]}${match[2].toLowerCase()}`);
+  }
+  return matches;
+}
+
+function buildTimeRange(times) {
+  if (times.length >= 2) {
+    return `${times[0]}-${times[1]}`;
+  }
+  return times[0] || "";
+}
+
+function tokenize(value) {
+  return normalizeText(value)
+    .split(" ")
+    .filter((token) => token && !TAB_STOPWORDS.has(token));
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function toTitleCase(value) {
+  return String(value)
+    .toLowerCase()
+    .split(" ")
+    .filter(Boolean)
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(" ");
+}
+
+function formatUserName(event) {
+  if (event?.name) {
+    return event.name;
+  }
+
+  if (event?.email) {
+    const localPart = String(event.email).split("@")[0] || "";
+    const cleaned = localPart.replace(/[._-]+/g, " ").trim();
+    if (cleaned) {
+      return toTitleCase(cleaned);
+    }
+  }
+
+  if (event?.employee_code) {
+    return `Employee ${event.employee_code}`;
+  }
+
+  if (event?.seatalk_id) {
+    return `User ${event.seatalk_id}`;
+  }
+
+  return "there";
+}
+
+function stripBotMention(text) {
+  if (!text) {
+    return text;
+  }
+
+  const escaped = escapeRegExp(BOT_NAME);
+  const compact = escapeRegExp(BOT_NAME.replace(/\s+/g, ""));
+  const mentionPattern = new RegExp(`@?(?:${escaped}|${compact})`, "ig");
+  return text.replace(mentionPattern, "").replace(/\s+/g, " ").trim();
+}
+
+const profileCache = new Map();
+
+function getProfileCacheKey(event) {
+  return event?.seatalk_id || event?.employee_code || event?.email || null;
+}
+
+function getCachedProfileName(key) {
+  if (!key || !profileCache.has(key)) {
+    return null;
+  }
+
+  const entry = profileCache.get(key);
+  if (!entry || Date.now() > entry.expiresAtMs) {
+    profileCache.delete(key);
+    return null;
+  }
+
+  return entry.name;
+}
+
+function cacheProfileName(key, name) {
+  if (!key || !name || SEATALK_PROFILE_CACHE_MINUTES <= 0) {
+    return;
+  }
+
+  profileCache.set(key, {
+    name,
+    expiresAtMs: Date.now() + SEATALK_PROFILE_CACHE_MINUTES * 60 * 1000
+  });
+}
+
+function extractDisplayName(profile) {
+  if (!profile) {
+    return null;
+  }
+
+  if (Array.isArray(profile)) {
+    return extractDisplayName(profile[0]);
+  }
+
+  if (typeof profile === "string") {
+    return profile.trim() || null;
+  }
+
+  const candidates = [
+    profile.name,
+    profile.display_name,
+    profile.displayName,
+    profile.employee_name,
+    profile.user_name,
+    profile.full_name,
+    profile.fullName,
+    profile.nickname,
+    profile.user?.name,
+    profile.user?.display_name,
+    profile.employee?.name,
+    profile.employee?.display_name
+  ];
+
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.trim()) {
+      return candidate.trim();
+    }
+  }
+
+  return null;
+}
+
+async function fetchSeatalkProfileName(event) {
+  if (!SEATALK_PROFILE_URL) {
+    return null;
+  }
+
+  const payload = {};
+  if (event?.seatalk_id) {
+    payload.seatalk_id = event.seatalk_id;
+  }
+  if (event?.employee_code) {
+    payload.employee_code = event.employee_code;
+  }
+  if (event?.email) {
+    payload.email = event.email;
+  }
+
+  if (!Object.keys(payload).length) {
+    return null;
+  }
+
+  try {
+    const response = await requestWithAuth(
+      SEATALK_PROFILE_METHOD,
+      SEATALK_PROFILE_URL,
+      payload
+    );
+    const data = response.data?.data ?? response.data;
+    return extractDisplayName(data);
+  } catch (error) {
+    console.warn(
+      "Failed to fetch Seatalk profile name:",
+      error.response?.data || error.message
+    );
+    return null;
+  }
+}
+
+async function getSeatalkDisplayName(event) {
+  if (event?.name) {
+    return event.name;
+  }
+
+  const cacheKey = getProfileCacheKey(event);
+  const cached = getCachedProfileName(cacheKey);
+  if (cached) {
+    return cached;
+  }
+
+  const fetched = await fetchSeatalkProfileName(event);
+  if (fetched) {
+    cacheProfileName(cacheKey, fetched);
+    return fetched;
+  }
+
+  return formatUserName(event);
+}
+
+function scoreTabMatch(userMessage, tabName) {
+  const normalizedQuery = normalizeText(userMessage);
+  const normalizedTab = normalizeText(tabName);
+  if (!normalizedTab) {
+    return 0;
+  }
+
+  if (normalizedQuery.includes(normalizedTab)) {
+    return 1;
+  }
+
+  const queryTimes = buildTimeRange(extractTimes(normalizedQuery));
+  const tabTimes = buildTimeRange(extractTimes(normalizedTab));
+
+  let score = 0;
+  if (queryTimes && tabTimes && queryTimes === tabTimes) {
+    score += 0.6;
+  }
+
+  const queryTokens = new Set(tokenize(normalizedQuery));
+  const tabTokens = new Set(tokenize(normalizedTab));
+  if (tabTokens.size > 0) {
+    let matches = 0;
+    for (const token of tabTokens) {
+      if (queryTokens.has(token)) {
+        matches += 1;
+      }
+    }
+    const overlap = matches / tabTokens.size;
+    score += overlap * 0.4;
+  }
+
+  return Math.min(1, score);
+}
+
+function shouldSuggestTabs(userMessage) {
+  const normalized = normalizeText(userMessage);
+  const hasShiftKeyword = /\b(shift|tab|schedule)\b/.test(normalized);
+  const times = extractTimes(normalized);
+  return hasShiftKeyword || times.length >= 2;
+}
+
+let sheetsApiClient = null;
+let sheetsApiInitPromise = null;
+
+function hasOAuthConfig() {
+  return Boolean(
+    GOOGLE_OAUTH_CLIENT_ID &&
+      GOOGLE_OAUTH_CLIENT_SECRET &&
+      GOOGLE_OAUTH_REDIRECT_URL
+  );
+}
+
+function loadOAuthToken() {
+  if (!fs.existsSync(GOOGLE_OAUTH_TOKEN_FILE)) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(fs.readFileSync(GOOGLE_OAUTH_TOKEN_FILE, "utf8"));
+  } catch (error) {
+    console.warn("Failed to parse Google OAuth token file:", error.message);
+    return null;
+  }
+}
+
+function saveOAuthToken(token) {
+  fs.writeFileSync(GOOGLE_OAUTH_TOKEN_FILE, JSON.stringify(token, null, 2));
+}
+
+function buildOAuthClient() {
+  return new google.auth.OAuth2(
+    GOOGLE_OAUTH_CLIENT_ID,
+    GOOGLE_OAUTH_CLIENT_SECRET,
+    GOOGLE_OAUTH_REDIRECT_URL
+  );
+}
+
+async function initOAuthClient() {
+  if (!hasOAuthConfig()) {
+    return null;
+  }
+
+  const token = loadOAuthToken();
+  if (!token) {
+    return null;
+  }
+
+  const client = buildOAuthClient();
+  client.setCredentials(token);
+  return client;
+}
+
+async function initServiceAccountClient() {
+  if (!GOOGLE_SERVICE_ACCOUNT_FILE) {
+    return null;
+  }
+
+  if (!fs.existsSync(GOOGLE_SERVICE_ACCOUNT_FILE)) {
+    console.warn(
+      `Google service account file not found: ${GOOGLE_SERVICE_ACCOUNT_FILE}`
+    );
+    return null;
+  }
+
+  let credentials;
+  try {
+    credentials = JSON.parse(
+      fs.readFileSync(GOOGLE_SERVICE_ACCOUNT_FILE, "utf8")
+    );
+  } catch (error) {
+    console.warn(
+      "Failed to parse Google service account file:",
+      error.message
+    );
+    return null;
+  }
+
+  const auth = new google.auth.GoogleAuth({
+    credentials,
+    scopes: GOOGLE_SHEETS_SCOPES
+  });
+  return auth.getClient();
+}
+
+async function getSheetsApi() {
+  if (sheetsApiClient) {
+    return sheetsApiClient;
+  }
+
+  if (!sheetsApiInitPromise) {
+    sheetsApiInitPromise = (async () => {
+      const oauthClient = await initOAuthClient();
+      if (oauthClient) {
+        sheetsApiClient = google.sheets({ version: "v4", auth: oauthClient });
+        return sheetsApiClient;
+      }
+
+      const serviceAccountClient = await initServiceAccountClient();
+      if (serviceAccountClient) {
+        sheetsApiClient = google.sheets({
+          version: "v4",
+          auth: serviceAccountClient
+        });
+        return sheetsApiClient;
+      }
+
+      return null;
+    })().finally(() => {
+      sheetsApiInitPromise = null;
+    });
+  }
+
+  return sheetsApiInitPromise;
+}
+
+const SHEET_STOPWORDS = new Set([
+  "the",
+  "and",
+  "for",
+  "are",
+  "with",
+  "that",
+  "this",
+  "from",
+  "your",
+  "you",
+  "about",
+  "what",
+  "when",
+  "where",
+  "which",
+  "who",
+  "how",
+  "can",
+  "could",
+  "would",
+  "should",
+  "please",
+  "thanks",
+  "hello",
+  "hi",
+  "hey"
+]);
+
+const sheetCache = {
+  lastLoadedAtMs: 0,
+  sheets: []
+};
+let sheetRefreshPromise = null;
+
+function parseSheetLink(line) {
+  const trimmed = line.trim();
+  if (!trimmed || trimmed.startsWith("#")) {
+    return null;
+  }
+
+  const idMatch = trimmed.match(/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+  if (!idMatch) {
+    return null;
+  }
+
+  const gidMatch = trimmed.match(/(?:[?#&]gid=)(\d+)/);
+  return {
+    id: idMatch[1],
+    gid: gidMatch ? gidMatch[1] : null,
+    url: trimmed
+  };
+}
+
+function buildSheetExportUrl(sheet) {
+  const gidParam = sheet.gid ? `&gid=${sheet.gid}` : "";
+  return `https://docs.google.com/spreadsheets/d/${sheet.id}/export?format=csv${gidParam}`;
+}
+
+function buildSheetUrlWithGid(spreadsheetId, sheetId) {
+  return `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit#gid=${sheetId}`;
+}
+
+function formatSheetRow(row) {
+  return row
+    .map((cell) => String(cell ?? "").replace(/\s+/g, " ").trim())
+    .join(" | ")
+    .trim();
+}
+
+async function fetchSheetValuesViaApi(api, sheet) {
+  const meta = await api.spreadsheets.get({
+    spreadsheetId: sheet.id,
+    fields: "properties/title,sheets(properties(sheetId,title))"
+  });
+
+  const spreadsheetTitle = meta.data.properties?.title || "Unknown Spreadsheet";
+  const sheets = meta.data.sheets || [];
+  if (!sheets.length) {
+    throw new Error("No tabs found in spreadsheet.");
+  }
+
+  if (sheet.gid) {
+    const byId = sheets.find(
+      (entry) => String(entry.properties?.sheetId) === String(sheet.gid)
+    );
+    const target = byId || sheets[0];
+    const sheetTitle = target?.properties?.title;
+    if (!sheetTitle) {
+      throw new Error("Unable to determine sheet name.");
+    }
+
+    const range = SHEETS_DEFAULT_RANGE
+      ? `${sheetTitle}!${SHEETS_DEFAULT_RANGE}`
+      : sheetTitle;
+    const valuesResponse = await api.spreadsheets.values.get({
+      spreadsheetId: sheet.id,
+      range
+    });
+
+    const values = valuesResponse.data.values || [];
+    const lines = values.map(formatSheetRow).filter(Boolean);
+    return [
+      {
+        ...sheet,
+        spreadsheetTitle,
+        tabName: sheetTitle,
+        url: buildSheetUrlWithGid(sheet.id, target.properties.sheetId),
+        lines
+      }
+    ];
+  }
+
+  if (!SHEETS_SCAN_ALL_TABS) {
+    const target = sheets[0];
+    const sheetTitle = target?.properties?.title;
+    if (!sheetTitle) {
+      throw new Error("Unable to determine sheet name.");
+    }
+
+    const range = SHEETS_DEFAULT_RANGE
+      ? `${sheetTitle}!${SHEETS_DEFAULT_RANGE}`
+      : sheetTitle;
+    const valuesResponse = await api.spreadsheets.values.get({
+      spreadsheetId: sheet.id,
+      range
+    });
+
+    const values = valuesResponse.data.values || [];
+    const lines = values.map(formatSheetRow).filter(Boolean);
+    return [
+      {
+        ...sheet,
+        spreadsheetTitle,
+        tabName: sheetTitle,
+        url: buildSheetUrlWithGid(sheet.id, target.properties.sheetId),
+        lines
+      }
+    ];
+  }
+
+  const tabs = sheets.slice(0, SHEETS_MAX_TABS);
+  const ranges = tabs.map((entry) => {
+    const title = entry.properties?.title;
+    return SHEETS_DEFAULT_RANGE ? `${title}!${SHEETS_DEFAULT_RANGE}` : title;
+  });
+
+  const valuesResponse = await api.spreadsheets.values.batchGet({
+    spreadsheetId: sheet.id,
+    ranges
+  });
+
+  const valueRanges = valuesResponse.data.valueRanges || [];
+  return valueRanges.map((range, index) => {
+    const tab = tabs[index];
+    const values = range.values || [];
+    const lines = values.map(formatSheetRow).filter(Boolean);
+    return {
+      ...sheet,
+      spreadsheetTitle,
+      tabName: tab?.properties?.title || "Unknown",
+      url: buildSheetUrlWithGid(sheet.id, tab?.properties?.sheetId),
+      lines
+    };
+  });
+}
+
+async function fetchSheetCsv(sheet) {
+  const exportUrl = buildSheetExportUrl(sheet);
+  const response = await axios.get(exportUrl, { responseType: "text" });
+  const csvText = typeof response.data === "string" ? response.data : "";
+
+  if (!csvText || /<html/i.test(csvText)) {
+    throw new Error("Sheet is not public or returned HTML.");
+  }
+
+  const lines = csvText.split(/\r?\n/).filter((line) => line.length > 0);
+  return {
+    ...sheet,
+    lines
+  };
+}
+
+async function refreshSheetCache() {
+  if (sheetRefreshPromise) {
+    return sheetRefreshPromise;
+  }
+
+  sheetRefreshPromise = (async () => {
+    if (!fs.existsSync(SHEETS_FILE)) {
+      sheetCache.sheets = [];
+      sheetCache.lastLoadedAtMs = Date.now();
+      return;
+    }
+
+    const raw = fs.readFileSync(SHEETS_FILE, "utf8");
+    const links = raw
+      .split(/\r?\n/)
+      .map(parseSheetLink)
+      .filter(Boolean);
+
+    const sheetsApi = await getSheetsApi();
+    if (!sheetsApi && (hasOAuthConfig() || GOOGLE_SERVICE_ACCOUNT_FILE)) {
+      console.warn(
+        "Google Sheets API client not available. Check OAuth or service account config."
+      );
+    }
+
+    const sheets = [];
+    for (const link of links) {
+      try {
+        const sheetData = sheetsApi
+          ? await fetchSheetValuesViaApi(sheetsApi, link)
+          : await fetchSheetCsv(link);
+        const entries = Array.isArray(sheetData) ? sheetData : [sheetData];
+        sheets.push(...entries);
+      } catch (error) {
+        console.warn(
+          `Failed to load sheet ${link.url}:`,
+          error.response?.data || error.message
+        );
+      }
+    }
+
+    sheetCache.sheets = sheets;
+    sheetCache.lastLoadedAtMs = Date.now();
+  })().finally(() => {
+    sheetRefreshPromise = null;
+  });
+
+  return sheetRefreshPromise;
+}
+
+function extractKeywords(text) {
+  const words = text
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter((word) => word.length >= 3 && !SHEET_STOPWORDS.has(word));
+
+  return Array.from(new Set(words));
+}
+
+function buildSheetContext(userMessage, options = {}) {
+  if (!sheetCache.sheets.length) {
+    return "";
+  }
+
+  const preferredTab = options.preferredTab || null;
+  const sheetsToSearch = preferredTab
+    ? sheetCache.sheets.filter(
+        (sheet) =>
+          sheet.id === preferredTab.id &&
+          sheet.tabName === preferredTab.tabName
+      )
+    : sheetCache.sheets;
+
+  const keywords = extractKeywords(userMessage);
+  if (!keywords.length) {
+    return "";
+  }
+
+  const parts = [];
+  let totalChars = 0;
+
+  for (const sheet of sheetsToSearch) {
+    const matches = [];
+    for (const line of sheet.lines) {
+      const lower = line.toLowerCase();
+      if (keywords.some((keyword) => lower.includes(keyword))) {
+        matches.push(line);
+      }
+      if (matches.length >= SHEETS_MAX_MATCH_LINES) {
+        break;
+      }
+    }
+
+    if (!matches.length) {
+      continue;
+    }
+
+    const header = sheet.lines[0];
+    const snippetLines = header ? [header, ...matches] : matches;
+    const snippet = snippetLines.join("\n");
+    const label = sheet.tabName
+      ? `Sheet: ${sheet.url} (tab: ${sheet.tabName})`
+      : `Sheet: ${sheet.url}`;
+    const block = `${label}\n${snippet}`;
+
+    if (totalChars + block.length > SHEETS_MAX_CONTEXT_CHARS) {
+      break;
+    }
+
+    parts.push(block);
+    totalChars += block.length;
+  }
+
+  return parts.join("\n\n");
+}
+
+function startSheetRefreshTimer() {
+  refreshSheetCache().catch((error) => {
+    console.warn("Initial sheet load failed:", error.message);
+  });
+
+  if (SHEETS_REFRESH_MINUTES > 0) {
+    const intervalMs = SHEETS_REFRESH_MINUTES * 60 * 1000;
+    setInterval(() => {
+      refreshSheetCache().catch((error) => {
+        console.warn("Sheet refresh failed:", error.message);
+      });
+    }, intervalMs).unref();
+  }
+}
+
+function findTabMatch(userMessage) {
+  if (!sheetCache.sheets.length) {
+    return null;
+  }
+
+  const candidates = sheetCache.sheets.filter((sheet) => sheet.tabName);
+  if (!candidates.length) {
+    return null;
+  }
+
+  const scored = candidates
+    .map((sheet) => ({
+      sheet,
+      score: scoreTabMatch(userMessage, sheet.tabName)
+    }))
+    .sort((a, b) => b.score - a.score);
+
+  const best = scored[0];
+  if (!best || best.score <= 0) {
+    return null;
+  }
+
+  const suggestions = scored
+    .filter((entry) => entry.score >= TAB_SUGGEST_MIN_SCORE)
+    .slice(0, TAB_SUGGEST_LIMIT)
+    .map((entry) => entry.sheet);
+
+  return {
+    match:
+      best.score >= TAB_MATCH_MIN_SCORE ? best.sheet : null,
+    suggestions,
+    bestScore: best.score
+  };
+}
+
+function buildTabSuggestionReply(suggestions) {
+  const formatted = suggestions
+    .map((sheet) => {
+      const label = sheet.spreadsheetTitle
+        ? `${sheet.tabName} - ${sheet.spreadsheetTitle}`
+        : sheet.tabName;
+      return `- ${label}`;
+    })
+    .join("\n");
+
+  return `Did you mean one of these tabs?\n${formatted}`;
+}
+
+async function generateIntelligentReply(userMessage, options = {}) {
+  if (!OPENROUTER_API_KEY || !OPENROUTER_MODEL) {
+    return "Thanks for your message! (AI not configured yet.)";
+  }
+
+  const systemPrompt = `You are ${BOT_NAME}, a helpful SeaTalk bot. Respond intelligently, short, and concise (1-3 sentences). Do not include greetings.`;
+  const sheetContext = buildSheetContext(userMessage, {
+    preferredTab: options.preferredTab
+  });
+  const messages = [{ role: "system", content: systemPrompt }];
+
+  if (options.preferredTab) {
+    const label = options.preferredTab.spreadsheetTitle
+      ? `${options.preferredTab.tabName} - ${options.preferredTab.spreadsheetTitle}`
+      : options.preferredTab.tabName;
+    messages.push({
+      role: "system",
+      content: `Use data from the "${label}" tab only.`
+    });
+  }
+
+  if (sheetContext) {
+    messages.push({
+      role: "system",
+      content: `Context from team sheets (partial, may be outdated):\n${sheetContext}`
+    });
+  }
+
+  try {
+    const response = await axios.post(
+      `${OPENROUTER_API_BASE_URL}/chat/completions`,
+      {
+        model: OPENROUTER_MODEL,
+        messages: [...messages, { role: "user", content: userMessage }],
+        temperature: 0.3,
+        max_tokens: 120
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+          "HTTP-Referer": OPENROUTER_APP_URL || undefined,
+          "X-Title": OPENROUTER_APP_TITLE || undefined,
+          "Content-Type": "application/json"
+        }
+      }
+    );
+
+    const reply = response.data?.choices?.[0]?.message?.content?.trim();
+    return reply || "Thanks for your message.";
+  } catch (error) {
+    console.error(
+      "OpenRouter reply failed:",
+      error.response?.data || error.message
+    );
+    return "Thanks for your message. I'm having trouble responding right now.";
+  }
+}
+
+async function handleSubscriberMessage(event) {
+  const employee_code = event.employee_code;
+  const rawText = event.message?.text?.content?.trim();
+  const msgText = stripBotMention(rawText);
+
+  if (!employee_code) {
+    return;
+  }
+
+  if (!msgText) {
+    await replyToSubscriber(
+      employee_code,
+      "I can only read text messages right now."
+    );
+    return;
+  }
+
+  const userName = await getSeatalkDisplayName(event);
+  const greeting = `Hello ${userName} 👋`;
+
+  if (!sheetCache.sheets.length) {
+    await refreshSheetCache();
+  }
+
+  const tabMatch = findTabMatch(msgText);
+  if (
+    tabMatch &&
+    !tabMatch.match &&
+    tabMatch.suggestions.length > 0 &&
+    shouldSuggestTabs(msgText)
+  ) {
+    const suggestionReply = buildTabSuggestionReply(tabMatch.suggestions);
+    await replyToSubscriber(employee_code, `${greeting}\n${suggestionReply}`);
+    return;
+  }
+
+  const reply = await generateIntelligentReply(msgText, {
+    preferredTab: tabMatch?.match || null
+  });
+  const fullReply = reply ? `${greeting}\n${reply}` : greeting;
+  await replyToSubscriber(employee_code, fullReply);
+}
+
+// Send text message to subscriber
+async function replyToSubscriber(employee_code, content) {
+  try {
+    const response = await postWithAuth(
+      `${SEATALK_API_BASE_URL}/messaging/v2/single_chat`,
+      {
+        employee_code: employee_code,
+        message: {
+          tag: "text",
+          text: {
+            format: 1, // 1 = markdown, 2 = plain text
+            content: content
+          }
+        },
+        usable_platform: "all"
+      }
+    );
+
+    if (response.data.code === 0) {
+      console.log("Message sent successfully:", response.data.message_id);
+    } else {
+      console.error("Failed to send message:", response.data);
+    }
+  } catch (err) {
+    console.error("Error sending message:", err.response?.data || err.message);
+  }
+}
+
+// ======================
+// Google OAuth for Sheets
+// ======================
+app.get("/google/oauth/start", (req, res) => {
+  if (!hasOAuthConfig()) {
+    return res
+      .status(500)
+      .send("Google OAuth is not configured. Check your .env settings.");
+  }
+
+  const oauthClient = buildOAuthClient();
+  const authUrl = oauthClient.generateAuthUrl({
+    access_type: "offline",
+    prompt: "consent",
+    scope: GOOGLE_SHEETS_SCOPES
+  });
+
+  return res.redirect(authUrl);
+});
+
+app.get("/google/oauth/callback", async (req, res) => {
+  if (!hasOAuthConfig()) {
+    return res
+      .status(500)
+      .send("Google OAuth is not configured. Check your .env settings.");
+  }
+
+  const code = Array.isArray(req.query.code)
+    ? req.query.code[0]
+    : req.query.code;
+  const error = Array.isArray(req.query.error)
+    ? req.query.error[0]
+    : req.query.error;
+
+  if (error) {
+    return res.status(400).send(`OAuth error: ${error}`);
+  }
+
+  if (!code) {
+    return res.status(400).send("Missing OAuth code.");
+  }
+
+  try {
+    const oauthClient = buildOAuthClient();
+    const { tokens } = await oauthClient.getToken(code);
+    oauthClient.setCredentials(tokens);
+    saveOAuthToken(tokens);
+    sheetsApiClient = google.sheets({ version: "v4", auth: oauthClient });
+
+    refreshSheetCache().catch((refreshError) => {
+      console.warn("Sheet refresh failed after OAuth:", refreshError.message);
+    });
+
+    return res.send(
+      "Google OAuth connected. You can close this tab and use the bot."
+    );
+  } catch (oauthError) {
+    console.error(
+      "Google OAuth callback failed:",
+      oauthError.response?.data || oauthError.message
+    );
+    return res.status(500).send("OAuth failed. Check server logs.");
+  }
+});
+
+// ======================
+// Callback endpoint
+// ======================
+app.post("/seatalk/callback", (req, res) => {
+  const bodyRaw = JSON.stringify(req.body);
+  const signature = req.headers["signature"] || "";
+
+  // 1️⃣ Verify signature
+  if (!isValidSignature(bodyRaw, signature)) {
+    console.log("Invalid signature:", signature);
+    return res.status(400).send("Invalid signature");
+  }
+
+  const data = req.body;
+  const eventType = data.event_type;
+
+  console.log("SeaTalk event received:", JSON.stringify(data, null, 2));
+
+  // 2️⃣ Handle verification event
+  if (eventType === EVENT_VERIFICATION) {
+    return res.send(data.event);
+  }
+
+  // 3️⃣ Handle other events
+  switch (eventType) {
+    case NEW_BOT_SUBSCRIBER:
+      console.log("New subscriber:", data);
+      break;
+
+    case MESSAGE_FROM_BOT_SUBSCRIBER:
+      console.log("Message from subscriber:", data);
+      handleSubscriberMessage(data.event).catch((err) => {
+        console.error(
+          "Failed to handle subscriber message:",
+          err.response?.data || err.message
+        );
+      });
+      break;
+
+    case INTERACTIVE_MESSAGE_CLICK:
+      console.log("Interactive message clicked:", data);
+      break;
+
+    case BOT_ADDED_TO_GROUP_CHAT:
+      console.log("Bot added to group:", data);
+      break;
+
+    case BOT_REMOVED_FROM_GROUP_CHAT:
+      console.log("Bot removed from group:", data);
+      break;
+
+    case NEW_MENTIONED_MESSAGE_RECEIVED_FROM_GROUP_CHAT:
+      console.log("Bot mentioned in group:", data);
+      break;
+
+    default:
+      console.log("Unknown event:", data);
+  }
+
+  res.status(200).send(""); // Must respond 200 OK
+});
+
+// ======================
+// Start server
+// ======================
+startSheetRefreshTimer();
+
+const PORT = 3000;
+app.listen(PORT, () => {
+  console.log(`Server running on http://localhost:${PORT}`);
+});

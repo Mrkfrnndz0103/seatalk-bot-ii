@@ -1,0 +1,3 @@
+SeaTalk is an enterprise messaging platform.
+Bots can respond to 1-on-1 chats and group mentions.
+All responses must be accurate and professional.

@@ -9,7 +9,7 @@ function retrieve(query, options = {}, store) {
   const topK =
     Number.isInteger(options.topK) && options.topK > 0 ? options.topK : 3;
 
-  const items = store.load();
+  const items = Array.isArray(store.items) ? store.items : store.load();
   if (!query) {
     return items.slice(0, topK);
   }

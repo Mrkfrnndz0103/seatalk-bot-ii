@@ -1,10 +1,15 @@
 const DEFAULT_INDEX_STORE_PATH = "./data/chunks.jsonl";
+const DEFAULT_SHEETS_FILE = "./sheets.txt";
 const DEFAULT_MAX_ROWS_TO_SCAN = 2000;
 const DEFAULT_MAX_COLS_TO_SCAN = 200;
 
-function parsePositiveInt(value, fallback) {
+function parseNonNegativeInt(value, fallback) {
+  if (value === undefined || value === null || value === "") {
+    return fallback;
+  }
+
   const parsed = Number(value);
-  if (!Number.isFinite(parsed) || parsed <= 0) {
+  if (!Number.isFinite(parsed) || parsed < 0) {
     return fallback;
   }
   return Math.floor(parsed);
@@ -21,12 +26,13 @@ const env = {
   GOOGLE_OAUTH_CLIENT_SECRET: process.env.GOOGLE_OAUTH_CLIENT_SECRET || "",
   GOOGLE_OAUTH_REDIRECT_URL: process.env.GOOGLE_OAUTH_REDIRECT_URL || "",
   GOOGLE_OAUTH_TOKEN_FILE: process.env.GOOGLE_OAUTH_TOKEN_FILE || "",
+  SHEETS_FILE: process.env.SHEETS_FILE || DEFAULT_SHEETS_FILE,
   INDEX_STORE_PATH: process.env.INDEX_STORE_PATH || DEFAULT_INDEX_STORE_PATH,
-  MAX_ROWS_TO_SCAN: parsePositiveInt(
+  MAX_ROWS_TO_SCAN: parseNonNegativeInt(
     process.env.MAX_ROWS_TO_SCAN,
     DEFAULT_MAX_ROWS_TO_SCAN
   ),
-  MAX_COLS_TO_SCAN: parsePositiveInt(
+  MAX_COLS_TO_SCAN: parseNonNegativeInt(
     process.env.MAX_COLS_TO_SCAN,
     DEFAULT_MAX_COLS_TO_SCAN
   ),

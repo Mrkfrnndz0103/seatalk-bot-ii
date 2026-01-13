@@ -1,11 +1,19 @@
+const fs = require("fs");
+const path = require("path");
 const env = require("../config/env");
 const { listSpreadsheetsInFolder } = require("../clients/drive.client");
 const { getTabsAndGrid, readValues } = require("../clients/sheets.client");
 const { buildRange, colToLetter } = require("../utils/a1");
 const { toChunks } = require("./chunker");
 
+const TAB_READ_DELAY_MS = 400;
+
 function rowHasContent(row) {
   return row.some((cell) => String(cell ?? "").trim().length > 0);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function isPermissionError(error) {
@@ -63,6 +71,61 @@ function trimValues(values) {
   };
 }
 
+function parseSheetLink(line) {
+  const trimmed = String(line || "").trim();
+  if (!trimmed || trimmed.startsWith("#")) {
+    return null;
+  }
+
+  const idMatch = trimmed.match(/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+  if (!idMatch) {
+    return null;
+  }
+
+  return {
+    id: idMatch[1],
+    url: trimmed
+  };
+}
+
+function loadSheetsFromFile(filePath) {
+  if (!filePath) {
+    return [];
+  }
+
+  const resolved = path.resolve(filePath);
+  if (!fs.existsSync(resolved)) {
+    return [];
+  }
+
+  const raw = fs.readFileSync(resolved, "utf8");
+  const lines = raw.split(/\r?\n/);
+  const sheets = [];
+  let pendingLabel = "";
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith("#")) {
+      pendingLabel = trimmed.replace(/^#+\s*/, "").trim();
+      continue;
+    }
+
+    const link = parseSheetLink(trimmed);
+    if (!link) {
+      continue;
+    }
+
+    sheets.push({
+      id: link.id,
+      name: pendingLabel,
+      url: link.url
+    });
+    pendingLabel = "";
+  }
+
+  return sheets;
+}
+
 function buildFinalRange(tabTitle, finalRows, finalCols) {
   if (!finalRows || !finalCols) {
     return "";
@@ -76,10 +139,12 @@ async function indexDriveFolder(store) {
     throw new Error("store with clear() is required.");
   }
 
+  const sheetsFromFile = loadSheetsFromFile(env.SHEETS_FILE);
   const folderId = env.DRIVE_FOLDER_ID ? env.DRIVE_FOLDER_ID.trim() : "";
-  const spreadsheets = await listSpreadsheetsInFolder(
-    folderId || undefined
-  );
+  const spreadsheets =
+    sheetsFromFile.length > 0
+      ? sheetsFromFile
+      : await listSpreadsheetsInFolder(folderId || undefined);
   let tabsIndexed = 0;
   const allChunks = [];
 
@@ -104,14 +169,15 @@ async function indexDriveFolder(store) {
         continue;
       }
 
-      const rowsToScan = Math.min(
-        tab.rowCount || 0,
-        env.MAX_ROWS_TO_SCAN
-      );
-      const colsToScan = Math.min(
-        tab.colCount || 0,
-        env.MAX_COLS_TO_SCAN
-      );
+      const maxRows = env.MAX_ROWS_TO_SCAN;
+      const maxCols = env.MAX_COLS_TO_SCAN;
+      const rowCount = tab.rowCount || 0;
+      const colCount = tab.colCount || 0;
+
+      const rowsToScan =
+        maxRows > 0 ? Math.min(rowCount, maxRows) : rowCount;
+      const colsToScan =
+        maxCols > 0 ? Math.min(colCount, maxCols) : colCount;
 
       if (rowsToScan <= 0 || colsToScan <= 0) {
         continue;
@@ -126,6 +192,9 @@ async function indexDriveFolder(store) {
           console.warn(
             `Skipping tab ${tab.title} in ${spreadsheetId} due to permission error.`
           );
+          if (TAB_READ_DELAY_MS > 0) {
+            await sleep(TAB_READ_DELAY_MS);
+          }
           continue;
         }
         throw error;
@@ -133,6 +202,9 @@ async function indexDriveFolder(store) {
 
       const { trimmed, finalRows, finalCols } = trimValues(values);
       if (trimmed.length === 0 || finalRows === 0 || finalCols === 0) {
+        if (TAB_READ_DELAY_MS > 0) {
+          await sleep(TAB_READ_DELAY_MS);
+        }
         continue;
       }
 
@@ -150,6 +222,10 @@ async function indexDriveFolder(store) {
 
       allChunks.push(...chunks);
       tabsIndexed += 1;
+
+      if (TAB_READ_DELAY_MS > 0) {
+        await sleep(TAB_READ_DELAY_MS);
+      }
     }
   }
 

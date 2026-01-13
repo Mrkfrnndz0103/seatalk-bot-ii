@@ -1,4 +1,5 @@
 const { retrieve } = require("../retrieval/retriever");
+const { summarizeWithOpenRouter } = require("../retrieval/summarizer");
 
 const MAX_SNIPPET_CHARS = 200;
 
@@ -17,7 +18,11 @@ function formatSource(chunk) {
   return `${sheet} > ${tab} > ${range}`;
 }
 
-function handleSearch(query, ctx = {}) {
+function formatSourcesList(chunks) {
+  return chunks.map((chunk, index) => `${index + 1}) ${formatSource(chunk)}`);
+}
+
+async function handleSearch(query, ctx = {}) {
   const trimmed = String(query || "").trim();
   if (!trimmed) {
     return { text: "Usage: /search <query>" };
@@ -33,7 +38,22 @@ function handleSearch(query, ctx = {}) {
   const results = retrieve(trimmed, { topK }, store);
 
   if (!results.length) {
+    if (ctx.fallbackIfEmpty) {
+      return null;
+    }
     return { text: "No results found." };
+  }
+
+  const sourcesList = formatSourcesList(results);
+  const summary = await summarizeWithOpenRouter(
+    trimmed,
+    results,
+    sourcesList
+  );
+  if (summary) {
+    return {
+      text: `${summary}\n\nSources:\n${sourcesList.join("\n")}`
+    };
   }
 
   const lines = ["Search results:"];

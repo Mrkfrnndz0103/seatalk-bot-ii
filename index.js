@@ -979,9 +979,11 @@ async function generateIntelligentReply(userMessage, options = {}) {
   }
 
   const systemPrompt = `You are ${BOT_NAME}, a helpful SeaTalk bot. Respond intelligently, short, and concise (1-3 sentences). Do not include greetings.`;
-  const sheetContext = buildSheetContext(userMessage, {
-    preferredTab: options.preferredTab
-  });
+  const sheetContext = options.skipSheetContext
+    ? ""
+    : buildSheetContext(userMessage, {
+        preferredTab: options.preferredTab
+      });
   const messages = [{ role: "system", content: systemPrompt }];
 
   if (options.preferredTab) {
@@ -1054,7 +1056,7 @@ async function handleSubscriberMessage(event) {
     return;
   }
 
-  const loadedIndex = indexStore.load();
+  const loadedIndex = Array.isArray(indexStore.items) ? indexStore.items : [];
   if (!loadedIndex.length) {
     await replyToSubscriber(
       employee_code,
@@ -1065,7 +1067,8 @@ async function handleSubscriberMessage(event) {
 
   const searchReply = await commands.handle(`/search ${msgText}`, {
     store: indexStore,
-    topK: 3
+    topK: 3,
+    fallbackIfEmpty: true
   });
   if (searchReply && searchReply.text) {
     await replyToSubscriber(employee_code, searchReply.text);
@@ -1074,6 +1077,11 @@ async function handleSubscriberMessage(event) {
 
   const userName = await getSeatalkDisplayName(event);
   const greeting = `Hello ${userName} 👋`;
+  const fallbackReply = await generateIntelligentReply(msgText, { skipSheetContext: true });
+  const fallbackFullReply = fallbackReply ? `${greeting}\n${fallbackReply}` : greeting;
+  await replyToSubscriber(employee_code, fallbackFullReply);
+  return;
+
 
   if (!sheetCache.sheets.length) {
     await refreshSheetCache();

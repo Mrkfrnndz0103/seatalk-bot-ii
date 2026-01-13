@@ -12,6 +12,17 @@ function getGroupId(event) {
   );
 }
 
+function getThreadId(event) {
+  const threadId =
+    event?.message?.thread_id ||
+    event?.thread_id ||
+    null;
+  if (typeof threadId === "string" && threadId.trim()) {
+    return threadId.trim();
+  }
+  return null;
+}
+
 function getMessageText(event) {
   if (typeof event?.message?.text === "string") {
     return event.message.text;
@@ -184,6 +195,15 @@ async function handleGroupMention(event, deps) {
     return;
   }
 
+  const threadId = getThreadId(event);
+  if (typeof deps.sendGroupTyping === "function") {
+    deps.sendGroupTyping(groupId, threadId).catch((error) => {
+      if (deps.logger && deps.logger.warn) {
+        deps.logger.warn("group_typing_failed", { error: error.message });
+      }
+    });
+  }
+
   const rawText = getMessageText(event);
   const msgText = stripMentionedUsers(rawText, event, deps);
 
@@ -208,6 +228,7 @@ async function handleGroupMention(event, deps) {
     const convoReply = await deps.generateReply(msgText, {
       skipSheetContext: true,
       conversation: true,
+      useTools: false,
       prefetchChatHistory: true,
       groupId,
       logger: deps.logger,

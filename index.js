@@ -121,6 +121,19 @@ const OPENROUTER_APP_TITLE = env.OPENROUTER_APP_TITLE || "";
 const BOT_NAME = env.BOT_NAME || "OB Bot";
 const SEATALK_PROFILE_URL = env.SEATALK_PROFILE_URL || "";
 const SEATALK_PROFILE_METHOD = env.SEATALK_PROFILE_METHOD;
+const SEATALK_GROUP_TYPING_URL =
+  env.SEATALK_GROUP_TYPING_URL ||
+  (SEATALK_API_BASE_URL
+    ? `${SEATALK_API_BASE_URL}/messaging/v2/group_chat_typing`
+    : "");
+const SEATALK_SINGLE_CHAT_TYPING_URL =
+  env.SEATALK_SINGLE_CHAT_TYPING_URL ||
+  (SEATALK_API_BASE_URL
+    ? `${SEATALK_API_BASE_URL}/messaging/v2/single_chat_typing`
+    : "");
+const SEATALK_PROFILE_LOOKUP_ENABLED = env.SEATALK_PROFILE_LOOKUP_ENABLED;
+const SEATALK_PROFILE_LOOKUP_COOLDOWN_MS =
+  env.SEATALK_PROFILE_LOOKUP_COOLDOWN_MS;
 const SEATALK_PROFILE_CACHE_MINUTES = env.SEATALK_PROFILE_CACHE_MINUTES;
 const SHEETS_FILE = path.resolve(env.SHEETS_FILE);
 const GOOGLE_SERVICE_ACCOUNT_FILE = env.GOOGLE_SERVICE_ACCOUNT_FILE
@@ -502,7 +515,7 @@ function getGreetingOverride(profile) {
   }
 
   const title = override.gender === "female" ? "Ma'am" : "Sir";
-  return `Hello ${title} ${override.name} \u{1F44B}, How can I help you today?`;
+  return `Hello ${title} ${override.name} \u{1F44B}, How can I assist you today?`;
 }
 
 async function buildGreeting(event) {
@@ -516,10 +529,10 @@ async function buildGreeting(event) {
   const title = getTitleForProfile(profile);
   const timeGreeting = getTimeOfDayGreeting();
   if (title) {
-    return `Hello ${title} ${name} \u{1F44B} ${timeGreeting}!\nHow can I help you today?`;
+    return `Hello ${title} ${name} \u{1F44B} ${timeGreeting}!\nHow can I assist you today?`;
   }
 
-  return `Hello ${name} \u{1F44B} ${timeGreeting}!\nHow can I help you today?`;
+  return `Hello ${name} \u{1F44B} ${timeGreeting}!\nHow can I assist you today?`;
 }
 
 function getEventMessageText(event) {
@@ -641,6 +654,42 @@ function stripBotMention(text) {
 }
 
 const profileCache = new Map();
+let profileLookupDisabledUntilMs = 0;
+
+function shouldSkipProfileLookup() {
+  if (!SEATALK_PROFILE_LOOKUP_ENABLED) {
+    return true;
+  }
+  if (
+    profileLookupDisabledUntilMs &&
+    Date.now() < profileLookupDisabledUntilMs
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function getSeatalkErrorCode(error) {
+  const code =
+    error?.normalized?.code ||
+    error?.payload?.code ||
+    error?.response?.data?.code;
+  return Number.isFinite(Number(code)) ? Number(code) : null;
+}
+
+function disableProfileLookupTemporarily(reason) {
+  if (!SEATALK_PROFILE_LOOKUP_COOLDOWN_MS) {
+    return;
+  }
+  profileLookupDisabledUntilMs =
+    Date.now() + SEATALK_PROFILE_LOOKUP_COOLDOWN_MS;
+  if (logger && typeof logger.warn === "function") {
+    logger.warn("profile_lookup_disabled", {
+      reason,
+      untilMs: profileLookupDisabledUntilMs
+    });
+  }
+}
 const greetingOverrides = new Map([
   [
     "romark.fernandez@spxexpress.com",
@@ -833,6 +882,9 @@ async function fetchSeatalkProfileViaMcp(event) {
   if (!seatalkMcpTools) {
     return null;
   }
+  if (shouldSkipProfileLookup()) {
+    return null;
+  }
 
   const identity = getSeatalkIdentity(event);
   let employeeCode = identity.employee_code || null;
@@ -853,6 +905,10 @@ async function fetchSeatalkProfileViaMcp(event) {
   const response = await seatalkMcpTools.tools.get_employee_profile({
     employee_code: employeeCode
   });
+  if (response?.code === 103) {
+    disableProfileLookupTemporarily("permission_denied");
+    return null;
+  }
   if (response?.code !== 0) {
     return null;
   }
@@ -866,6 +922,10 @@ async function fetchSeatalkProfileViaMcp(event) {
 }
 
 async function fetchSeatalkProfile(event) {
+  if (shouldSkipProfileLookup()) {
+    return null;
+  }
+
   if (seatalkMcpTools) {
     try {
       const profile = await fetchSeatalkProfileViaMcp(event);
@@ -873,6 +933,9 @@ async function fetchSeatalkProfile(event) {
         return profile;
       }
     } catch (error) {
+      if (getSeatalkErrorCode(error) === 103) {
+        disableProfileLookupTemporarily("permission_denied");
+      }
       console.warn("MCP profile lookup failed:", error.message);
     }
   }
@@ -910,6 +973,9 @@ async function fetchSeatalkProfile(event) {
       email: extractEmail(data)
     };
   } catch (error) {
+    if (getSeatalkErrorCode(error) === 103) {
+      disableProfileLookupTemporarily("permission_denied");
+    }
     console.warn(
       "Failed to fetch Seatalk profile name:",
       error.response?.data || error.message
@@ -1544,7 +1610,8 @@ async function generateIntelligentReply(userMessage, options = {}) {
     sheetContext,
     extraSystemContext,
     prefetchChatHistory: options.prefetchChatHistory,
-    groupId: options.groupId
+    groupId: options.groupId,
+    useTools: options.useTools
   });
 }
 
@@ -1574,6 +1641,13 @@ async function handleSubscriberMessage(event, ctx = {}) {
       }
       return;
     }
+
+    sendSubscriberTyping(employee_code).catch((error) => {
+      log.warn("subscriber_typing_failed", {
+        requestId,
+        error: error.message
+      });
+    });
 
     if (!msgText) {
       await replyWithText("I can only read text messages right now.");
@@ -1637,6 +1711,7 @@ async function handleSubscriberMessage(event, ctx = {}) {
       const convoReply = await generateIntelligentReply(msgText, {
         skipSheetContext: true,
         conversation: true,
+        useTools: false,
         logger: log,
         requestId
       });
@@ -1784,6 +1859,19 @@ async function replyToSubscriber(employee_code, content) {
   }
 }
 
+async function sendSubscriberTyping(employeeCode) {
+  if (!SEATALK_SINGLE_CHAT_TYPING_URL) {
+    return;
+  }
+  if (!employeeCode) {
+    return;
+  }
+
+  await postWithAuth(SEATALK_SINGLE_CHAT_TYPING_URL, {
+    employee_code: employeeCode
+  });
+}
+
 async function sendGroupMessage(group_id, content) {
   const messagePayload = {
     tag: "text",
@@ -1838,6 +1926,22 @@ async function sendGroupMessage(group_id, content) {
       err.response?.data || err.message
     );
   }
+}
+
+async function sendGroupTyping(groupId, threadId) {
+  if (!SEATALK_GROUP_TYPING_URL) {
+    return;
+  }
+  if (!groupId) {
+    return;
+  }
+
+  const payload = { group_id: groupId };
+  if (threadId) {
+    payload.thread_id = threadId;
+  }
+
+  await postWithAuth(SEATALK_GROUP_TYPING_URL, payload);
 }
 
 // ======================
@@ -2122,6 +2226,7 @@ app.post("/seatalk/callback", (req, res) => {
             logger,
             readSheetRange,
             sendGroupMessage,
+            sendGroupTyping,
             postWithAuth,
             apiBaseUrl: SEATALK_API_BASE_URL
           })

@@ -158,6 +158,12 @@ const MCP_SERVER_NAME = env.MCP_SERVER_NAME;
 const MCP_TIMEOUT_MS = env.MCP_TIMEOUT_MS;
 const MCP_RETRY_MAX = env.MCP_RETRY_MAX;
 const MCP_RETRY_BASE_MS = env.MCP_RETRY_BASE_MS;
+const BACKLOGS_SCHEDULED_GROUP_ID = env.BACKLOGS_SCHEDULED_GROUP_ID;
+const BACKLOGS_IMAGE_SHEET_ID = env.BACKLOGS_IMAGE_SHEET_ID;
+const BACKLOGS_IMAGE_TAB_NAME = env.BACKLOGS_IMAGE_TAB_NAME;
+const BACKLOGS_IMAGE_GID = env.BACKLOGS_IMAGE_GID;
+const BACKLOGS_IMAGE_RANGE = env.BACKLOGS_IMAGE_RANGE;
+const BACKLOGS_TIMEZONE = env.BACKLOGS_TIMEZONE;
 
 const seatalkMcpClient = new SeatalkMcpClient({
   endpoint: MCP_ENDPOINT,
@@ -1112,6 +1118,10 @@ function shouldSuggestTabs(userMessage) {
 
 let sheetsApiClient = null;
 let sheetsApiInitPromise = null;
+let oauthClient = null;
+let oauthInitPromise = null;
+let serviceAccountClient = null;
+let serviceAccountInitPromise = null;
 
 function hasOAuthConfig() {
   return Boolean(
@@ -1222,6 +1232,284 @@ async function getSheetsApi() {
   }
 
   return sheetsApiInitPromise;
+}
+
+async function getGoogleOAuthClient() {
+  if (oauthClient) {
+    return oauthClient;
+  }
+  if (!oauthInitPromise) {
+    oauthInitPromise = initOAuthClient().finally(() => {
+      oauthInitPromise = null;
+    });
+  }
+  oauthClient = await oauthInitPromise;
+  return oauthClient;
+}
+
+async function getGoogleServiceAccountClient() {
+  if (serviceAccountClient) {
+    return serviceAccountClient;
+  }
+  if (!serviceAccountInitPromise) {
+    serviceAccountInitPromise = initServiceAccountClient().finally(() => {
+      serviceAccountInitPromise = null;
+    });
+  }
+  serviceAccountClient = await serviceAccountInitPromise;
+  return serviceAccountClient;
+}
+
+async function getAccessTokenForClient(authClient) {
+  if (!authClient) {
+    return null;
+  }
+  const tokenResponse = await authClient.getAccessToken();
+  if (typeof tokenResponse === "string") {
+    return tokenResponse;
+  }
+  return tokenResponse?.token || null;
+}
+
+async function getGoogleAccessTokenCandidates() {
+  const candidates = [];
+  const oauth = await getGoogleOAuthClient();
+  const oauthToken = await getAccessTokenForClient(oauth);
+  if (oauthToken) {
+    candidates.push({ token: oauthToken, source: "oauth" });
+  }
+
+  const serviceClient = await getGoogleServiceAccountClient();
+  const serviceToken = await getAccessTokenForClient(serviceClient);
+  if (serviceToken && serviceToken !== oauthToken) {
+    candidates.push({ token: serviceToken, source: "service_account" });
+  }
+
+  return candidates;
+}
+
+async function fetchSheetTabId(spreadsheetId, tabName) {
+  const sheetsApi = await getSheetsApi();
+  if (!sheetsApi) {
+    return null;
+  }
+
+  const response = await sheetsApi.spreadsheets.get({
+    spreadsheetId,
+    fields: "sheets(properties(sheetId,title))"
+  });
+  const sheets = response.data.sheets || [];
+  const normalizedTarget = String(tabName || "").trim().toLowerCase();
+  const match = sheets.find(
+    (sheet) =>
+      String(sheet.properties?.title || "").trim().toLowerCase() ===
+      normalizedTarget
+  );
+  return match?.properties?.sheetId || null;
+}
+
+function buildSheetPngExportUrl(spreadsheetId, gid, range) {
+  const gidParam = gid ? `&gid=${gid}` : "";
+  const rangeParam = range ? `&range=${encodeURIComponent(range)}` : "";
+  return `https://docs.google.com/spreadsheets/d/${spreadsheetId}/export?format=png${gidParam}${rangeParam}`;
+}
+
+function isHtmlResponse(data, headers = {}) {
+  const contentType = String(headers["content-type"] || "").toLowerCase();
+  if (contentType.includes("text/html")) {
+    return true;
+  }
+  if (!data) {
+    return false;
+  }
+  const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data);
+  const prefix = buffer.slice(0, 32).toString("utf8").toLowerCase().trim();
+  return prefix.startsWith("<!doctype html") || prefix.startsWith("<html");
+}
+
+async function tryFetchSheetPng(exportUrl, token, source) {
+  const headers = {};
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
+  }
+  try {
+    const response = await axios.get(exportUrl, {
+      responseType: "arraybuffer",
+      headers,
+      validateStatus: () => true
+    });
+    if (
+      response.status >= 200 &&
+      response.status < 300 &&
+      !isHtmlResponse(response.data, response.headers)
+    ) {
+      return { ok: true, data: response.data };
+    }
+    return {
+      ok: false,
+      error: {
+        source,
+        status: response.status,
+        contentType: response.headers?.["content-type"] || ""
+      }
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error: {
+        source,
+        status: error.response?.status || null,
+        message: error.message
+      }
+    };
+  }
+}
+
+async function fetchSheetPngBase64(spreadsheetId, tabName, range) {
+  if (!spreadsheetId) {
+    return null;
+  }
+
+  let gid = BACKLOGS_IMAGE_GID || "";
+  if (!gid && tabName) {
+    gid = await fetchSheetTabId(spreadsheetId, tabName);
+  }
+
+  const exportUrl = buildSheetPngExportUrl(spreadsheetId, gid, range);
+  const attempts = [];
+  const candidates = await getGoogleAccessTokenCandidates();
+
+  for (const candidate of candidates) {
+    const result = await tryFetchSheetPng(
+      exportUrl,
+      candidate.token,
+      candidate.source
+    );
+    if (result.ok) {
+      return Buffer.from(result.data).toString("base64");
+    }
+    if (result.error) {
+      attempts.push(result.error);
+    }
+  }
+
+  if (!candidates.length) {
+    const result = await tryFetchSheetPng(exportUrl, null, "unauthenticated");
+    if (result.ok) {
+      return Buffer.from(result.data).toString("base64");
+    }
+    if (result.error) {
+      attempts.push(result.error);
+    }
+  }
+
+  if (attempts.length && logger && typeof logger.warn === "function") {
+    logger.warn("backlogs_image_fetch_failed", { attempts });
+  }
+  return null;
+}
+
+function formatBacklogsTimestamp(date = new Date()) {
+  const timeZone = BACKLOGS_TIMEZONE || "UTC";
+  try {
+    const timeLabel = new Intl.DateTimeFormat("en-US", {
+      hour: "numeric",
+      minute: "2-digit",
+      hour12: true,
+      timeZone
+    }).format(date);
+    const dateLabel = new Intl.DateTimeFormat("en-US", {
+      year: "numeric",
+      month: "short",
+      day: "2-digit",
+      timeZone
+    }).format(date);
+    return `${timeLabel} - ${dateLabel}`;
+  } catch (error) {
+    const timeLabel = new Intl.DateTimeFormat("en-US", {
+      hour: "numeric",
+      minute: "2-digit",
+      hour12: true
+    }).format(date);
+    const dateLabel = new Intl.DateTimeFormat("en-US", {
+      year: "numeric",
+      month: "short",
+      day: "2-digit"
+    }).format(date);
+    return `${timeLabel} - ${dateLabel}`;
+  }
+}
+
+function buildBacklogsScheduledText(date = new Date()) {
+  const timestamp = formatBacklogsTimestamp(date);
+  return `@all Sharing OB Pending for Dispatch as of ${timestamp}`;
+}
+
+let backlogsUpdateInFlight = false;
+async function sendBacklogsScheduledUpdate() {
+  if (!BACKLOGS_SCHEDULED_GROUP_ID) {
+    return;
+  }
+  if (!BACKLOGS_IMAGE_SHEET_ID) {
+    logger.warn("backlogs_schedule_missing_sheet_id");
+    return;
+  }
+  if (backlogsUpdateInFlight) {
+    logger.warn("backlogs_schedule_skip_overlap");
+    return;
+  }
+
+    backlogsUpdateInFlight = true;
+    try {
+      const messageText = buildBacklogsScheduledText(new Date());
+      if (!messageText) {
+        logger.warn("backlogs_schedule_missing_text");
+        return;
+      }
+
+      const imageBase64 = await fetchSheetPngBase64(
+        BACKLOGS_IMAGE_SHEET_ID,
+        BACKLOGS_IMAGE_TAB_NAME,
+        BACKLOGS_IMAGE_RANGE
+      );
+      if (!imageBase64) {
+        logger.warn("backlogs_schedule_missing_image");
+        return;
+      }
+
+      const imageSent = await sendGroupMessage(BACKLOGS_SCHEDULED_GROUP_ID, {
+        tag: "image",
+        image: {
+          content: imageBase64
+        }
+      });
+      if (!imageSent) {
+        logger.warn("backlogs_schedule_image_send_failed");
+        return;
+      }
+
+      const textSent = await sendGroupMessage(
+        BACKLOGS_SCHEDULED_GROUP_ID,
+        messageText
+      );
+      if (!textSent) {
+        logger.warn("backlogs_schedule_text_send_failed");
+        return;
+      }
+      trackSystemEvent(BotEventType.BACKLOGS_SCHEDULED, {
+        groupId: BACKLOGS_SCHEDULED_GROUP_ID
+      });
+      logger.info("backlogs_schedule_sent", {
+        groupId: BACKLOGS_SCHEDULED_GROUP_ID,
+      hasImage: Boolean(imageBase64)
+    });
+  } catch (error) {
+    logger.error("backlogs_schedule_failed", {
+      error: error.response?.data || error.message
+    });
+  } finally {
+    backlogsUpdateInFlight = false;
+  }
 }
 
 const SHEET_STOPWORDS = new Set([
@@ -1872,14 +2160,43 @@ async function sendSubscriberTyping(employeeCode) {
   });
 }
 
-async function sendGroupMessage(group_id, content) {
-  const messagePayload = {
+function buildGroupMessagePayload(content) {
+  if (content && typeof content === "object" && content.tag) {
+    return content;
+  }
+  if (content && typeof content === "object") {
+    const nestedText =
+      typeof content.text === "string"
+        ? content.text
+        : content.text?.content;
+    if (nestedText) {
+      return {
+        tag: "text",
+        text: {
+          format: 1,
+          content: String(nestedText)
+        }
+      };
+    }
+  }
+  const text = String(content || "").trim();
+  if (!text) {
+    return null;
+  }
+  return {
     tag: "text",
     text: {
       format: 1,
-      content
+      content: text
     }
   };
+}
+
+async function sendGroupMessage(group_id, content) {
+  const messagePayload = buildGroupMessagePayload(content);
+  if (!messagePayload) {
+    throw new Error("Missing group message content.");
+  }
 
   if (seatalkMcpTools) {
     try {
@@ -1889,7 +2206,7 @@ async function sendGroupMessage(group_id, content) {
       );
       if (response?.code === 0) {
         console.log("Group message sent successfully:", response.message_id);
-        return;
+        return true;
       }
       if (response?.code) {
         console.error(
@@ -1917,15 +2234,16 @@ async function sendGroupMessage(group_id, content) {
 
     if (response.data.code === 0) {
       console.log("Group message sent successfully:", response.data.message_id);
-    } else {
-      console.error("Failed to send group message:", response.data);
+      return true;
     }
+    console.error("Failed to send group message:", response.data);
   } catch (err) {
     console.error(
       "Error sending group message:",
       err.response?.data || err.message
     );
   }
+  return false;
 }
 
 async function sendGroupTyping(groupId, threadId) {
@@ -2263,7 +2581,7 @@ app.post("/seatalk/callback", (req, res) => {
 // Start server
 // ======================
 startSheetRefreshTimer();
-scheduler.startScheduler(trackSystemEvent);
+scheduler.startScheduler(trackSystemEvent, sendBacklogsScheduledUpdate);
 
 const PORT = env.PORT;
 app.listen(PORT, () => {

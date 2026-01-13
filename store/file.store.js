@@ -1,5 +1,6 @@
 const fs = require("fs");
 const path = require("path");
+const { tokenize } = require("../utils/text");
 
 class FileStore {
   constructor(options = {}) {
@@ -10,6 +11,7 @@ class FileStore {
 
     this.filePath = path.resolve(filePath);
     this.items = [];
+    this.invertedIndex = new Map();
     this.ensureDirectory();
   }
 
@@ -46,6 +48,7 @@ class FileStore {
     }
 
     this.items = parsed;
+    this.buildIndex(parsed);
     return this.items;
   }
 
@@ -53,6 +56,7 @@ class FileStore {
     this.ensureDirectory();
     fs.writeFileSync(this.filePath, "");
     this.items = [];
+    this.invertedIndex = new Map();
   }
 
   upsertChunks(chunks) {
@@ -62,10 +66,29 @@ class FileStore {
 
     this.ensureDirectory();
     this.items = chunks;
+    this.buildIndex(chunks);
 
     const payload = chunks.map((chunk) => JSON.stringify(chunk)).join("\n");
     fs.writeFileSync(this.filePath, payload ? `${payload}\n` : "");
     return this.items;
+  }
+
+  buildIndex(items) {
+    const index = new Map();
+    items.forEach((item, itemIndex) => {
+      const tokens = Array.isArray(item.tokens)
+        ? item.tokens
+        : tokenize(item?.text || "");
+      item.tokens = tokens;
+      const unique = new Set(tokens);
+      for (const token of unique) {
+        if (!index.has(token)) {
+          index.set(token, []);
+        }
+        index.get(token).push(itemIndex);
+      }
+    });
+    this.invertedIndex = index;
   }
 
   search(query, topK = 5) {

@@ -2,6 +2,18 @@ const DEFAULT_INDEX_STORE_PATH = "./data/chunks.jsonl";
 const DEFAULT_SHEETS_FILE = "./sheets.txt";
 const DEFAULT_MAX_ROWS_TO_SCAN = 2000;
 const DEFAULT_MAX_COLS_TO_SCAN = 200;
+const DEFAULT_REQUEST_BODY_LIMIT = "1mb";
+const DEFAULT_RATE_LIMIT_WINDOW_MS = 60 * 1000;
+const DEFAULT_RATE_LIMIT_MAX = 60;
+const DEFAULT_PROFILE_CACHE_MINUTES = 60;
+const DEFAULT_SHEETS_REFRESH_MINUTES = 15;
+const DEFAULT_SHEETS_MAX_TABS = 10;
+const DEFAULT_SHEETS_MAX_MATCH_LINES = 8;
+const DEFAULT_SHEETS_MAX_CONTEXT_CHARS = 3000;
+const DEFAULT_SEARCH_LLM_TIMEOUT_MS = 1800;
+const DEFAULT_SEARCH_LLM_CACHE_TTL_MS = 120 * 1000;
+const DEFAULT_HTTP_TIMEOUT_MS = 8000;
+const DEFAULT_SCHEDULED_INTERVAL_MINUTES = 0;
 
 function parseNonNegativeInt(value, fallback) {
   if (value === undefined || value === null || value === "") {
@@ -15,7 +27,67 @@ function parseNonNegativeInt(value, fallback) {
   return Math.floor(parsed);
 }
 
+function parsePositiveInt(value, fallback) {
+  const parsed = parseNonNegativeInt(value, fallback);
+  return parsed > 0 ? parsed : fallback;
+}
+
+function parseBoolean(value, fallback = false) {
+  if (value === undefined || value === null || value === "") {
+    return fallback;
+  }
+
+  const normalized = String(value).trim().toLowerCase();
+  if (["true", "1", "yes", "y"].includes(normalized)) {
+    return true;
+  }
+  if (["false", "0", "no", "n"].includes(normalized)) {
+    return false;
+  }
+  return fallback;
+}
+
 const env = {
+  PORT: parsePositiveInt(process.env.PORT, 3000),
+  REQUEST_BODY_LIMIT:
+    process.env.REQUEST_BODY_LIMIT || DEFAULT_REQUEST_BODY_LIMIT,
+  RATE_LIMIT_WINDOW_MS: parsePositiveInt(
+    process.env.RATE_LIMIT_WINDOW_MS,
+    DEFAULT_RATE_LIMIT_WINDOW_MS
+  ),
+  RATE_LIMIT_MAX: parsePositiveInt(
+    process.env.RATE_LIMIT_MAX,
+    DEFAULT_RATE_LIMIT_MAX
+  ),
+  SIGNING_SECRET: process.env.SIGNING_SECRET || "",
+  BOT_ACCESS_TOKEN: process.env.BOT_ACCESS_TOKEN || "",
+  SEATALK_API_BASE_URL:
+    process.env.SEATALK_API_BASE_URL || "https://openapi.seatalk.io",
+  SEATALK_TOKEN_URL: process.env.SEATALK_TOKEN_URL || "",
+  SEATALK_APP_ID: process.env.SEATALK_APP_ID || "",
+  SEATALK_APP_SECRET: process.env.SEATALK_APP_SECRET || "",
+  SEATALK_PROFILE_URL: process.env.SEATALK_PROFILE_URL || "",
+  SEATALK_PROFILE_METHOD: String(
+    process.env.SEATALK_PROFILE_METHOD || "post"
+  ).toLowerCase(),
+  SEATALK_PROFILE_CACHE_MINUTES: parsePositiveInt(
+    process.env.SEATALK_PROFILE_CACHE_MINUTES,
+    DEFAULT_PROFILE_CACHE_MINUTES
+  ),
+  SEATALK_HTTP_TIMEOUT_MS: parsePositiveInt(
+    process.env.SEATALK_HTTP_TIMEOUT_MS,
+    DEFAULT_HTTP_TIMEOUT_MS
+  ),
+  OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY || "",
+  OPENROUTER_MODEL: process.env.OPENROUTER_MODEL || "",
+  OPENROUTER_API_BASE_URL: process.env.OPENROUTER_API_BASE_URL || "",
+  OPENROUTER_APP_URL: process.env.OPENROUTER_APP_URL || "",
+  OPENROUTER_APP_TITLE: process.env.OPENROUTER_APP_TITLE || "",
+  OPENROUTER_HTTP_TIMEOUT_MS: parsePositiveInt(
+    process.env.OPENROUTER_HTTP_TIMEOUT_MS,
+    DEFAULT_HTTP_TIMEOUT_MS
+  ),
+  BOT_NAME: process.env.BOT_NAME || "SeaTalk Bot",
   DRIVE_FOLDER_ID: process.env.DRIVE_FOLDER_ID || "",
   GOOGLE_PROJECT_ID: process.env.GOOGLE_PROJECT_ID || "",
   GOOGLE_CLIENT_EMAIL: process.env.GOOGLE_CLIENT_EMAIL || "",
@@ -26,8 +98,32 @@ const env = {
   GOOGLE_OAUTH_CLIENT_SECRET: process.env.GOOGLE_OAUTH_CLIENT_SECRET || "",
   GOOGLE_OAUTH_REDIRECT_URL: process.env.GOOGLE_OAUTH_REDIRECT_URL || "",
   GOOGLE_OAUTH_TOKEN_FILE: process.env.GOOGLE_OAUTH_TOKEN_FILE || "",
+  GOOGLE_SERVICE_ACCOUNT_FILE: process.env.GOOGLE_SERVICE_ACCOUNT_FILE || "",
+  GOOGLE_SHEETS_SCOPES: (process.env.GOOGLE_SHEETS_SCOPES ||
+    "https://www.googleapis.com/auth/spreadsheets.readonly")
+    .split(",")
+    .map((scope) => scope.trim())
+    .filter(Boolean),
   SHEETS_FILE: process.env.SHEETS_FILE || DEFAULT_SHEETS_FILE,
   INDEX_STORE_PATH: process.env.INDEX_STORE_PATH || DEFAULT_INDEX_STORE_PATH,
+  SHEETS_DEFAULT_RANGE: process.env.SHEETS_DEFAULT_RANGE || "",
+  SHEETS_SCAN_ALL_TABS: parseBoolean(process.env.SHEETS_SCAN_ALL_TABS, false),
+  SHEETS_MAX_TABS: parsePositiveInt(
+    process.env.SHEETS_MAX_TABS,
+    DEFAULT_SHEETS_MAX_TABS
+  ),
+  SHEETS_REFRESH_MINUTES: parsePositiveInt(
+    process.env.SHEETS_REFRESH_MINUTES,
+    DEFAULT_SHEETS_REFRESH_MINUTES
+  ),
+  SHEETS_MAX_MATCH_LINES: parsePositiveInt(
+    process.env.SHEETS_MAX_MATCH_LINES,
+    DEFAULT_SHEETS_MAX_MATCH_LINES
+  ),
+  SHEETS_MAX_CONTEXT_CHARS: parsePositiveInt(
+    process.env.SHEETS_MAX_CONTEXT_CHARS,
+    DEFAULT_SHEETS_MAX_CONTEXT_CHARS
+  ),
   MAX_ROWS_TO_SCAN: parseNonNegativeInt(
     process.env.MAX_ROWS_TO_SCAN,
     DEFAULT_MAX_ROWS_TO_SCAN
@@ -36,8 +132,22 @@ const env = {
     process.env.MAX_COLS_TO_SCAN,
     DEFAULT_MAX_COLS_TO_SCAN
   ),
-  SEATALK_BOT_TOKEN: process.env.SEATALK_BOT_TOKEN || "",
-  SEATALK_SIGNING_SECRET: process.env.SEATALK_SIGNING_SECRET || ""
+  SEARCH_USE_LLM_SUMMARY: parseBoolean(
+    process.env.SEARCH_USE_LLM_SUMMARY,
+    false
+  ),
+  SEARCH_LLM_TIMEOUT_MS: parsePositiveInt(
+    process.env.SEARCH_LLM_TIMEOUT_MS,
+    DEFAULT_SEARCH_LLM_TIMEOUT_MS
+  ),
+  SEARCH_LLM_CACHE_TTL_MS: parsePositiveInt(
+    process.env.SEARCH_LLM_CACHE_TTL_MS,
+    DEFAULT_SEARCH_LLM_CACHE_TTL_MS
+  ),
+  SCHEDULED_INTERVAL_MINUTES: parsePositiveInt(
+    process.env.SCHEDULED_INTERVAL_MINUTES,
+    DEFAULT_SCHEDULED_INTERVAL_MINUTES
+  )
 };
 
 module.exports = env;

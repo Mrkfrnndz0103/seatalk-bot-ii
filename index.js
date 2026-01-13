@@ -10,9 +10,82 @@ require("dotenv").config();
 const env = require("./config/env");
 const { FileStore } = require("./store/file.store");
 const commands = require("./commands");
+const intentService = require("./services/intent.service");
+const groupHandler = require("./services/group.handler");
+const interactiveHandler = require("./services/interactive.handler");
+const scheduler = require("./services/scheduler");
+const { logger } = require("./utils/logger");
+const { isValidSignature, getSignatureHeader } = require("./utils/signature");
+const { BotEventType } = require("./events/event.types");
+const { mapSeatalkEventType } = require("./events/event.mapper");
+const { trackEvent } = require("./events/event.tracker");
 
 const app = express();
-app.use(express.json());
+const rateLimitState = new Map();
+
+function rawBodySaver(req, res, buf) {
+  if (buf && buf.length) {
+    req.rawBody = buf;
+  }
+}
+
+function getClientIp(req) {
+  const forwarded = req.headers["x-forwarded-for"];
+  if (typeof forwarded === "string" && forwarded.trim()) {
+    return forwarded.split(",")[0].trim();
+  }
+  return req.ip || req.connection?.remoteAddress || "unknown";
+}
+
+function rateLimit(req, res, next) {
+  if (!env.RATE_LIMIT_MAX || env.RATE_LIMIT_MAX <= 0) {
+    return next();
+  }
+
+  const ip = getClientIp(req);
+  const now = Date.now();
+  const entry = rateLimitState.get(ip);
+  if (!entry || now > entry.resetAt) {
+    rateLimitState.set(ip, {
+      count: 1,
+      resetAt: now + env.RATE_LIMIT_WINDOW_MS
+    });
+    return next();
+  }
+
+  if (entry.count >= env.RATE_LIMIT_MAX) {
+    return res.status(429).send("Too Many Requests");
+  }
+
+  entry.count += 1;
+  return next();
+}
+
+function createRequestId() {
+  if (typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return crypto.randomBytes(16).toString("hex");
+}
+
+function trackSystemEvent(type, details) {
+  trackEvent({
+    type,
+    requestId: "system",
+    seatalkEventType: "system",
+    event: {},
+    logger,
+    details
+  });
+}
+
+app.use(
+  express.json({
+    verify: rawBodySaver,
+    limit: env.REQUEST_BODY_LIMIT
+  })
+);
+app.use(rateLimit);
 
 const indexStore = new FileStore({ path: env.INDEX_STORE_PATH });
 indexStore.load();
@@ -20,59 +93,40 @@ indexStore.load();
 // ======================
 // Your bot settings
 // ======================
-const SIGNING_SECRET = process.env.SIGNING_SECRET;
-const STATIC_BOT_ACCESS_TOKEN = process.env.BOT_ACCESS_TOKEN;
-const SEATALK_API_BASE_URL =
-  process.env.SEATALK_API_BASE_URL || "https://openapi.seatalk.io";
-const SEATALK_TOKEN_URL = process.env.SEATALK_TOKEN_URL;
-const SEATALK_APP_ID = process.env.SEATALK_APP_ID;
-const SEATALK_APP_SECRET = process.env.SEATALK_APP_SECRET;
-const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
-const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL;
-const RAW_OPENROUTER_API_BASE_URL = process.env.OPENROUTER_API_BASE_URL;
+const SIGNING_SECRET = env.SIGNING_SECRET;
+const STATIC_BOT_ACCESS_TOKEN = env.BOT_ACCESS_TOKEN;
+const SEATALK_API_BASE_URL = env.SEATALK_API_BASE_URL;
+const SEATALK_TOKEN_URL = env.SEATALK_TOKEN_URL;
+const SEATALK_APP_ID = env.SEATALK_APP_ID;
+const SEATALK_APP_SECRET = env.SEATALK_APP_SECRET;
+const OPENROUTER_API_KEY = env.OPENROUTER_API_KEY;
+const OPENROUTER_MODEL = env.OPENROUTER_MODEL;
 const OPENROUTER_API_BASE_URL =
-  normalizeOpenRouterBaseUrl(RAW_OPENROUTER_API_BASE_URL) ||
+  normalizeOpenRouterBaseUrl(env.OPENROUTER_API_BASE_URL) ||
   "https://openrouter.ai/api/v1";
-const OPENROUTER_APP_URL = process.env.OPENROUTER_APP_URL || "";
-const OPENROUTER_APP_TITLE = process.env.OPENROUTER_APP_TITLE || "";
-const BOT_NAME = process.env.BOT_NAME || "OB Bot";
-const SEATALK_PROFILE_URL = process.env.SEATALK_PROFILE_URL || "";
-const SEATALK_PROFILE_METHOD = String(
-  process.env.SEATALK_PROFILE_METHOD || "post"
-).toLowerCase();
-const SEATALK_PROFILE_CACHE_MINUTES = Number(
-  process.env.SEATALK_PROFILE_CACHE_MINUTES || 720
-);
-const SHEETS_FILE = process.env.SHEETS_FILE
-  ? path.resolve(process.env.SHEETS_FILE)
-  : path.join(__dirname, "sheets.txt");
-const GOOGLE_SERVICE_ACCOUNT_FILE = process.env.GOOGLE_SERVICE_ACCOUNT_FILE
-  ? path.resolve(process.env.GOOGLE_SERVICE_ACCOUNT_FILE)
+const OPENROUTER_APP_URL = env.OPENROUTER_APP_URL || "";
+const OPENROUTER_APP_TITLE = env.OPENROUTER_APP_TITLE || "";
+const BOT_NAME = env.BOT_NAME || "OB Bot";
+const SEATALK_PROFILE_URL = env.SEATALK_PROFILE_URL || "";
+const SEATALK_PROFILE_METHOD = env.SEATALK_PROFILE_METHOD;
+const SEATALK_PROFILE_CACHE_MINUTES = env.SEATALK_PROFILE_CACHE_MINUTES;
+const SHEETS_FILE = path.resolve(env.SHEETS_FILE);
+const GOOGLE_SERVICE_ACCOUNT_FILE = env.GOOGLE_SERVICE_ACCOUNT_FILE
+  ? path.resolve(env.GOOGLE_SERVICE_ACCOUNT_FILE)
   : null;
-const GOOGLE_OAUTH_CLIENT_ID = process.env.GOOGLE_OAUTH_CLIENT_ID;
-const GOOGLE_OAUTH_CLIENT_SECRET = process.env.GOOGLE_OAUTH_CLIENT_SECRET;
-const GOOGLE_OAUTH_REDIRECT_URL = process.env.GOOGLE_OAUTH_REDIRECT_URL;
-const GOOGLE_OAUTH_TOKEN_FILE = process.env.GOOGLE_OAUTH_TOKEN_FILE
-  ? path.resolve(process.env.GOOGLE_OAUTH_TOKEN_FILE)
+const GOOGLE_OAUTH_CLIENT_ID = env.GOOGLE_OAUTH_CLIENT_ID;
+const GOOGLE_OAUTH_CLIENT_SECRET = env.GOOGLE_OAUTH_CLIENT_SECRET;
+const GOOGLE_OAUTH_REDIRECT_URL = env.GOOGLE_OAUTH_REDIRECT_URL;
+const GOOGLE_OAUTH_TOKEN_FILE = env.GOOGLE_OAUTH_TOKEN_FILE
+  ? path.resolve(env.GOOGLE_OAUTH_TOKEN_FILE)
   : path.join(__dirname, "google-token.json");
-const GOOGLE_SHEETS_SCOPES = (process.env.GOOGLE_SHEETS_SCOPES ||
-  "https://www.googleapis.com/auth/spreadsheets.readonly")
-  .split(",")
-  .map((scope) => scope.trim())
-  .filter(Boolean);
-const SHEETS_DEFAULT_RANGE = process.env.SHEETS_DEFAULT_RANGE || "";
-const SHEETS_SCAN_ALL_TABS =
-  String(process.env.SHEETS_SCAN_ALL_TABS || "").toLowerCase() === "true";
-const SHEETS_MAX_TABS = Number(process.env.SHEETS_MAX_TABS || 10);
-const SHEETS_REFRESH_MINUTES = Number(
-  process.env.SHEETS_REFRESH_MINUTES || 15
-);
-const SHEETS_MAX_MATCH_LINES = Number(
-  process.env.SHEETS_MAX_MATCH_LINES || 8
-);
-const SHEETS_MAX_CONTEXT_CHARS = Number(
-  process.env.SHEETS_MAX_CONTEXT_CHARS || 3000
-);
+const GOOGLE_SHEETS_SCOPES = env.GOOGLE_SHEETS_SCOPES;
+const SHEETS_DEFAULT_RANGE = env.SHEETS_DEFAULT_RANGE;
+const SHEETS_SCAN_ALL_TABS = env.SHEETS_SCAN_ALL_TABS;
+const SHEETS_MAX_TABS = env.SHEETS_MAX_TABS;
+const SHEETS_REFRESH_MINUTES = env.SHEETS_REFRESH_MINUTES;
+const SHEETS_MAX_MATCH_LINES = env.SHEETS_MAX_MATCH_LINES;
+const SHEETS_MAX_CONTEXT_CHARS = env.SHEETS_MAX_CONTEXT_CHARS;
 
 // ======================
 // Event types
@@ -90,17 +144,6 @@ const NEW_MENTIONED_MESSAGE_RECEIVED_FROM_GROUP_CHAT = "new_mentioned_message_re
 // ======================
 
 // Verify signature
-function isValidSignature(body, signature) {
-  if (!SIGNING_SECRET) {
-    return false;
-  }
-
-  const hash = crypto
-    .createHash("sha256")
-    .update(Buffer.concat([Buffer.from(body), Buffer.from(SIGNING_SECRET)]))
-    .digest("hex");
-  return hash === signature;
-}
 
 const TOKEN_REFRESH_BUFFER_MS = 60 * 1000;
 const TOKEN_FALLBACK_TTL_MS = 2 * 60 * 60 * 1000;
@@ -113,11 +156,15 @@ function hasTokenCredentials() {
 }
 
 async function requestAccessToken() {
-  const response = await axios.post(SEATALK_TOKEN_URL, {
-    // Adjust keys to match the Seatalk token endpoint requirements.
-    app_id: SEATALK_APP_ID,
-    app_secret: SEATALK_APP_SECRET
-  });
+  const response = await axios.post(
+    SEATALK_TOKEN_URL,
+    {
+      // Adjust keys to match the Seatalk token endpoint requirements.
+      app_id: SEATALK_APP_ID,
+      app_secret: SEATALK_APP_SECRET
+    },
+    { timeout: env.SEATALK_HTTP_TIMEOUT_MS }
+  );
 
   const payload = response.data?.data || response.data;
   const token = payload?.access_token || payload?.app_access_token;
@@ -177,6 +224,7 @@ async function requestWithAuth(method, url, payload) {
   const config = {
     method: normalizedMethod,
     url,
+    timeout: env.SEATALK_HTTP_TIMEOUT_MS,
     headers: {
       Authorization: `Bearer ${token}`,
       "Content-Type": "application/json"
@@ -317,6 +365,21 @@ function formatUserName(event) {
 
   return "there";
 }
+
+function formatFirstName(value) {
+  const cleaned = String(value || "").trim();
+  if (!cleaned) {
+    return "there";
+  }
+  return cleaned.split(/\s+/)[0];
+}
+
+function buildGreeting(event) {
+  const firstName = formatFirstName(formatUserName(event));
+  return `Hi ${firstName} 👋 How can I help you today?`;
+}
+
+const KNOWN_COMMANDS = new Set(["help", "search", "reindex"]);
 
 function stripBotMention(text) {
   if (!text) {
@@ -779,7 +842,10 @@ async function fetchSheetValuesViaApi(api, sheet) {
 
 async function fetchSheetCsv(sheet) {
   const exportUrl = buildSheetExportUrl(sheet);
-  const response = await axios.get(exportUrl, { responseType: "text" });
+  const response = await axios.get(exportUrl, {
+    responseType: "text",
+    timeout: env.SEATALK_HTTP_TIMEOUT_MS
+  });
   const csvText = typeof response.data === "string" ? response.data : "";
 
   if (!csvText || /<html/i.test(csvText)) {
@@ -978,7 +1044,10 @@ async function generateIntelligentReply(userMessage, options = {}) {
     return "Thanks for your message! (AI not configured yet.)";
   }
 
-  const systemPrompt = `You are ${BOT_NAME}, a helpful SeaTalk bot. Respond intelligently, short, and concise (1-3 sentences). Do not include greetings.`;
+  const systemPrompt =
+    `You are ${BOT_NAME}, a helpful SeaTalk bot. Respond intelligently, short, and concise (1-3 sentences). Do not include greetings. ` +
+    "If the request is about backlogs, top contributors by region, or truck requests, answer using the provided sheet context. " +
+    "If it is unclear or does not match, ask one brief clarifying question and give one example query.";
   const sheetContext = options.skipSheetContext
     ? ""
     : buildSheetContext(userMessage, {
@@ -1004,6 +1073,7 @@ async function generateIntelligentReply(userMessage, options = {}) {
   }
 
   try {
+    const startedAt = Date.now();
     const response = await axios.post(
       `${OPENROUTER_API_BASE_URL}/chat/completions`,
       {
@@ -1013,6 +1083,7 @@ async function generateIntelligentReply(userMessage, options = {}) {
         max_tokens: 120
       },
       {
+        timeout: options.timeoutMs || env.OPENROUTER_HTTP_TIMEOUT_MS,
         headers: {
           Authorization: `Bearer ${OPENROUTER_API_KEY}`,
           "HTTP-Referer": OPENROUTER_APP_URL || undefined,
@@ -1021,6 +1092,14 @@ async function generateIntelligentReply(userMessage, options = {}) {
         }
       }
     );
+
+    if (options.logger && typeof options.logger.info === "function") {
+      const payload = { ms: Date.now() - startedAt };
+      if (options.requestId) {
+        payload.requestId = options.requestId;
+      }
+      options.logger.info("llm_reply_ms", payload);
+    }
 
     const reply = response.data?.choices?.[0]?.message?.content?.trim();
     return reply || "Thanks for your message.";
@@ -1033,78 +1112,130 @@ async function generateIntelligentReply(userMessage, options = {}) {
   }
 }
 
-async function handleSubscriberMessage(event) {
-  const employee_code = event.employee_code;
-  const rawText = event.message?.text?.content?.trim();
-  const msgText = stripBotMention(rawText);
+async function handleSubscriberMessage(event, ctx = {}) {
+  const requestId = ctx.requestId || "unknown";
+  const log = ctx.logger || logger;
+  const startedAt = Date.now();
+  const track = typeof ctx.trackEvent === "function" ? ctx.trackEvent : null;
 
-  if (!employee_code) {
-    return;
+  try {
+    const employee_code = event.employee_code;
+    const rawText = event.message?.text?.content?.trim();
+    const msgText = stripBotMention(rawText);
+    const greeting = buildGreeting(event);
+
+    const replyWithGreeting = async (text) => {
+      const content = text ? `${greeting}\n${text}` : greeting;
+      await replyToSubscriber(employee_code, content);
+    };
+
+    if (!employee_code) {
+      log.warn("subscriber_missing_employee_code", { requestId });
+      if (track) {
+        track(BotEventType.ERROR, { reason: "missing_employee_code" });
+      }
+      return;
+    }
+
+    if (!msgText) {
+      await replyWithGreeting("I can only read text messages right now.");
+      return;
+    }
+
+    const parsedCommand =
+      typeof commands.parseCommand === "function"
+        ? commands.parseCommand(msgText)
+        : null;
+    if (parsedCommand) {
+      log.info("command_received", {
+        requestId,
+        command: parsedCommand.cmd
+      });
+      if (track) {
+        track(BotEventType.COMMAND, { command: parsedCommand.cmd });
+        if (parsedCommand.cmd === "help") {
+          track(BotEventType.HELP_REQUEST, { command: parsedCommand.cmd });
+        } else if (!KNOWN_COMMANDS.has(parsedCommand.cmd)) {
+          track(BotEventType.INVALID_COMMAND, { command: parsedCommand.cmd });
+        }
+      }
+    }
+
+    const commandReply = await commands.handle(msgText, {
+      store: indexStore,
+      logger: log,
+      requestId
+    });
+    if (commandReply && commandReply.text) {
+      await replyWithGreeting(commandReply.text);
+      return;
+    }
+
+    const intentType = intentService.detectIntent(msgText);
+    if (intentType && track) {
+      track(BotEventType.KEYWORD_TRIGGER, { intent: intentType });
+    }
+
+    const intentReply = await intentService.handleIntentMessage(msgText, {
+      sheetCache,
+      refreshSheetCache
+    });
+    if (intentReply && intentReply.text) {
+      await replyWithGreeting(intentReply.text);
+      return;
+    }
+
+    const loadedIndex = Array.isArray(indexStore.items) ? indexStore.items : [];
+    if (!loadedIndex.length) {
+      await replyWithGreeting("Index is empty. Run /reindex to build it.");
+      return;
+    }
+
+    const searchReply = await commands.handle(`/search ${msgText}`, {
+      store: indexStore,
+      topK: 3,
+      fallbackIfEmpty: true,
+      logger: log,
+      requestId
+    });
+    if (searchReply && searchReply.text) {
+      await replyWithGreeting(searchReply.text);
+      return;
+    }
+
+    if (track) {
+      track(BotEventType.FALLBACK, { reason: "no_intent_no_search" });
+    }
+
+    const fallbackReply = await generateIntelligentReply(msgText, {
+      skipSheetContext: false,
+      logger: log,
+      requestId
+    });
+    await replyWithGreeting(fallbackReply || "Thanks for your message.");
+  } catch (error) {
+    log.error("subscriber_message_error", {
+      requestId,
+      error: error.message
+    });
+    if (track) {
+      track(BotEventType.ERROR, { error: error.message });
+    }
+    if (event?.employee_code) {
+      await replyToSubscriber(
+        event.employee_code,
+        "Sorry, I ran into an error while processing your request."
+      );
+    }
+  } finally {
+    log.info("subscriber_message_handled", {
+      requestId,
+      durationMs: Date.now() - startedAt
+    });
   }
-
-  if (!msgText) {
-    await replyToSubscriber(
-      employee_code,
-      "I can only read text messages right now."
-    );
-    return;
-  }
-
-  const commandReply = await commands.handle(msgText, { store: indexStore });
-  if (commandReply && commandReply.text) {
-    await replyToSubscriber(employee_code, commandReply.text);
-    return;
-  }
-
-  const loadedIndex = Array.isArray(indexStore.items) ? indexStore.items : [];
-  if (!loadedIndex.length) {
-    await replyToSubscriber(
-      employee_code,
-      "Index is empty. Run /reindex to build it."
-    );
-    return;
-  }
-
-  const searchReply = await commands.handle(`/search ${msgText}`, {
-    store: indexStore,
-    topK: 3,
-    fallbackIfEmpty: true
-  });
-  if (searchReply && searchReply.text) {
-    await replyToSubscriber(employee_code, searchReply.text);
-    return;
-  }
-
-  const userName = await getSeatalkDisplayName(event);
-  const greeting = `Hello ${userName} 👋`;
-  const fallbackReply = await generateIntelligentReply(msgText, { skipSheetContext: true });
-  const fallbackFullReply = fallbackReply ? `${greeting}\n${fallbackReply}` : greeting;
-  await replyToSubscriber(employee_code, fallbackFullReply);
-  return;
-
-
-  if (!sheetCache.sheets.length) {
-    await refreshSheetCache();
-  }
-
-  const tabMatch = findTabMatch(msgText);
-  if (
-    tabMatch &&
-    !tabMatch.match &&
-    tabMatch.suggestions.length > 0 &&
-    shouldSuggestTabs(msgText)
-  ) {
-    const suggestionReply = buildTabSuggestionReply(tabMatch.suggestions);
-    await replyToSubscriber(employee_code, `${greeting}\n${suggestionReply}`);
-    return;
-  }
-
-  const reply = await generateIntelligentReply(msgText, {
-    preferredTab: tabMatch?.match || null
-  });
-  const fullReply = reply ? `${greeting}\n${reply}` : greeting;
-  await replyToSubscriber(employee_code, fullReply);
 }
+
+
 
 // Send text message to subscriber
 async function replyToSubscriber(employee_code, content) {
@@ -1131,6 +1262,36 @@ async function replyToSubscriber(employee_code, content) {
     }
   } catch (err) {
     console.error("Error sending message:", err.response?.data || err.message);
+  }
+}
+
+async function sendGroupMessage(group_id, content) {
+  try {
+    const response = await postWithAuth(
+      `${SEATALK_API_BASE_URL}/messaging/v2/group_chat`,
+      {
+        group_id,
+        message: {
+          tag: "text",
+          text: {
+            format: 1,
+            content
+          }
+        },
+        usable_platform: "all"
+      }
+    );
+
+    if (response.data.code === 0) {
+      console.log("Group message sent successfully:", response.data.message_id);
+    } else {
+      console.error("Failed to send group message:", response.data);
+    }
+  } catch (err) {
+    console.error(
+      "Error sending group message:",
+      err.response?.data || err.message
+    );
   }
 }
 
@@ -1200,63 +1361,209 @@ app.get("/google/oauth/callback", async (req, res) => {
 });
 
 // ======================
-// Callback endpoint
+// Health endpoints
 // ======================
-app.post("/seatalk/callback", (req, res) => {
-  const bodyRaw = JSON.stringify(req.body);
-  const signature = req.headers["signature"] || "";
+app.get("/health", (req, res) => {
+  res.status(200).send("OK");
+});
 
-  // 1️⃣ Verify signature
-  if (!isValidSignature(bodyRaw, signature)) {
-    console.log("Invalid signature:", signature);
+app.get("/ready", (req, res) => {
+  const missing = [];
+  if (!env.SIGNING_SECRET) {
+    missing.push("SIGNING_SECRET");
+  }
+  const hasSeatalkCreds = Boolean(
+    env.BOT_ACCESS_TOKEN ||
+      (env.SEATALK_TOKEN_URL && env.SEATALK_APP_ID && env.SEATALK_APP_SECRET)
+  );
+  if (!hasSeatalkCreds) {
+    missing.push("SEATALK_CREDENTIALS");
+  }
+
+  const indexLoaded =
+    Array.isArray(indexStore.items) && indexStore.items.length > 0;
+  if (!indexLoaded) {
+    missing.push("INDEX_STORE");
+  }
+
+  const ok = missing.length === 0;
+  res.status(ok ? 200 : 503).json({
+    ok,
+    missing,
+    indexLoaded
+  });
+});
+
+app.post("/seatalk/notify", async (req, res) => {
+  const requestId = req.headers["x-request-id"] || createRequestId();
+  const bodyRaw = req.rawBody || Buffer.from(JSON.stringify(req.body || {}));
+  const signature = getSignatureHeader(req.headers);
+
+  if (!isValidSignature(bodyRaw, signature, SIGNING_SECRET)) {
+    logger.warn("invalid_signature_notification", { requestId });
     return res.status(400).send("Invalid signature");
   }
 
-  const data = req.body;
-  const eventType = data.event_type;
+  const { group_id, employee_code, message } = req.body || {};
+  if (!message) {
+    return res.status(400).send("Missing message");
+  }
 
-  console.log("SeaTalk event received:", JSON.stringify(data, null, 2));
+  trackEvent({
+    type: BotEventType.NOTIFICATION,
+    requestId,
+    seatalkEventType: "notification",
+    event: req.body || {},
+    logger,
+    details: {
+      group_id: group_id || null,
+      employee_code: employee_code || null
+    }
+  });
 
-  // 2️⃣ Handle verification event
+  if (group_id) {
+    await sendGroupMessage(group_id, message);
+    return res.json({ status: "ok", target: "group" });
+  }
+
+  if (employee_code) {
+    await replyToSubscriber(employee_code, message);
+    return res.json({ status: "ok", target: "dm" });
+  }
+
+  return res.status(400).send("Missing group_id or employee_code");
+});
+
+// ======================
+// Callback endpoint
+// ======================
+app.post("/seatalk/callback", (req, res) => {
+  const requestId = req.headers["x-request-id"] || createRequestId();
+  const startedAt = Date.now();
+  const bodyRaw = req.rawBody || Buffer.from(JSON.stringify(req.body || {}));
+  const signature = getSignatureHeader(req.headers);
+
+  // 1) Verify signature
+  if (!isValidSignature(bodyRaw, signature, SIGNING_SECRET)) {
+    logger.warn("invalid_signature", { requestId });
+    return res.status(400).send("Invalid signature");
+  }
+
+  const data = req.body || {};
+  const eventType = data.event_type || "unknown";
+  const eventPayload = data.event || data;
+  const track = (type, details) =>
+    trackEvent({
+      type,
+      requestId,
+      seatalkEventType: eventType,
+      event: eventPayload,
+      logger,
+      details
+    });
+
+  const mappedTypes = mapSeatalkEventType(eventType, eventPayload);
+  mappedTypes.forEach((type) => track(type));
+
+  logger.info("seatalk_event_received", {
+    requestId,
+    eventType
+  });
+
+  // 2) Handle verification event
   if (eventType === EVENT_VERIFICATION) {
+    logger.info("seatalk_event_verified", { requestId });
     return res.send(data.event);
   }
 
-  // 3️⃣ Handle other events
-  switch (eventType) {
-    case NEW_BOT_SUBSCRIBER:
-      console.log("New subscriber:", data);
-      break;
+  // 3) Handle other events
+  try {
+    switch (eventType) {
+      case NEW_BOT_SUBSCRIBER:
+        logger.info("new_subscriber", { requestId });
+        break;
 
     case MESSAGE_FROM_BOT_SUBSCRIBER:
-      console.log("Message from subscriber:", data);
-      handleSubscriberMessage(data.event).catch((err) => {
-        console.error(
-          "Failed to handle subscriber message:",
-          err.response?.data || err.message
-        );
+      logger.info("subscriber_message", { requestId });
+      handleSubscriberMessage(data.event, {
+        requestId,
+        logger,
+        trackEvent: track
+      }).catch((err) => {
+        logger.error("subscriber_message_failed", {
+          requestId,
+          error: err.response?.data || err.message
+        });
+        track(BotEventType.ERROR, {
+          error: err.response?.data || err.message
+        });
       });
       break;
 
     case INTERACTIVE_MESSAGE_CLICK:
-      console.log("Interactive message clicked:", data);
+      logger.info("interactive_message_click", { requestId });
+      interactiveHandler
+        .handleInteractiveEvent(data.event, { trackEvent: track })
+        .catch((err) => {
+          logger.error("interactive_event_failed", {
+            requestId,
+            error: err.response?.data || err.message
+          });
+          track(BotEventType.ERROR, {
+            error: err.response?.data || err.message
+          });
+        });
       break;
 
-    case BOT_ADDED_TO_GROUP_CHAT:
-      console.log("Bot added to group:", data);
-      break;
+      case BOT_ADDED_TO_GROUP_CHAT:
+        logger.info("bot_added_to_group", { requestId });
+        break;
 
-    case BOT_REMOVED_FROM_GROUP_CHAT:
-      console.log("Bot removed from group:", data);
-      break;
+      case BOT_REMOVED_FROM_GROUP_CHAT:
+        logger.info("bot_removed_from_group", { requestId });
+        break;
 
-    case NEW_MENTIONED_MESSAGE_RECEIVED_FROM_GROUP_CHAT:
-      console.log("Bot mentioned in group:", data);
-      break;
+      case NEW_MENTIONED_MESSAGE_RECEIVED_FROM_GROUP_CHAT:
+        logger.info("bot_mentioned_in_group", { requestId });
+        groupHandler
+          .handleGroupMention(data.event, {
+            sheetCache,
+            refreshSheetCache,
+            stripBotMention,
+            handleIntentMessage: intentService.handleIntentMessage,
+            parseCommand: commands.parseCommand,
+            knownCommands: KNOWN_COMMANDS,
+            detectIntent: intentService.detectIntent,
+            trackEvent: track,
+            buildGreeting,
+            postWithAuth,
+            apiBaseUrl: SEATALK_API_BASE_URL
+          })
+          .catch((err) => {
+            logger.error("group_mention_failed", {
+              requestId,
+              error: err.response?.data || err.message
+            });
+          });
+        break;
 
-    default:
-      console.log("Unknown event:", data);
+      default:
+        logger.info("unknown_event", { requestId, eventType });
+    }
+  } catch (error) {
+    logger.error("seatalk_event_error", {
+      requestId,
+      eventType,
+      error: error.message
+    });
   }
+
+  const durationMs = Date.now() - startedAt;
+  logger.info("seatalk_event_handled", {
+    requestId,
+    eventType,
+    durationMs
+  });
 
   res.status(200).send(""); // Must respond 200 OK
 });
@@ -1265,8 +1572,9 @@ app.post("/seatalk/callback", (req, res) => {
 // Start server
 // ======================
 startSheetRefreshTimer();
+scheduler.startScheduler(trackSystemEvent);
 
-const PORT = 3000;
+const PORT = env.PORT;
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
 });

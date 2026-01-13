@@ -1,0 +1,8 @@
+node_modules
+data
+.env
+google-token.json
+service-account.json
+*.log
+test
+docs

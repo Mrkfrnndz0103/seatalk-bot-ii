@@ -6,7 +6,7 @@ function buildFrequency(tokens) {
   return freq;
 }
 
-function score(queryTokens, chunkTextTokens) {
+function score(queryTokens, chunkTextTokens, options = {}) {
   if (!Array.isArray(queryTokens) || !Array.isArray(chunkTextTokens)) {
     return 0;
   }
@@ -15,13 +15,17 @@ function score(queryTokens, chunkTextTokens) {
     return 0;
   }
 
+  const maxPerToken =
+    Number.isFinite(options.maxPerToken) && options.maxPerToken > 0
+      ? options.maxPerToken
+      : 2;
   const queryFreq = buildFrequency(queryTokens);
   const chunkFreq = buildFrequency(chunkTextTokens);
   let overlap = 0;
 
   for (const [token, count] of queryFreq.entries()) {
     if (chunkFreq.has(token)) {
-      overlap += Math.min(count, chunkFreq.get(token));
+      overlap += Math.min(count, chunkFreq.get(token), maxPerToken);
     }
   }
 

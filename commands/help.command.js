@@ -3,7 +3,7 @@ function handleHelp() {
     text:
       "Available commands:\n" +
       "- /help\n" +
-      "- /search <query>\n" +
+      "- /search <query> [--ai]\n" +
       "- /reindex"
   };
 }

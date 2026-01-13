@@ -1,4 +1,5 @@
 const axios = require("axios");
+const env = require("../config/env");
 
 const DEFAULT_MAX_SNIPPET_CHARS = 800;
 
@@ -18,7 +19,7 @@ function buildExcerpt(text, maxChars = DEFAULT_MAX_SNIPPET_CHARS) {
 }
 
 function hasOpenRouterConfig() {
-  return Boolean(process.env.OPENROUTER_API_KEY && process.env.OPENROUTER_MODEL);
+  return Boolean(env.OPENROUTER_API_KEY && env.OPENROUTER_MODEL);
 }
 
 function buildContext(chunks, sourcesList) {
@@ -31,16 +32,16 @@ function buildContext(chunks, sourcesList) {
   return `Sources:\n${blocks.join("\n\n")}`;
 }
 
-async function summarizeWithOpenRouter(question, chunks, sourcesList) {
+async function summarizeWithOpenRouter(question, chunks, sourcesList, options = {}) {
   if (!hasOpenRouterConfig()) {
     return "";
   }
 
-  const baseUrl = normalizeBaseUrl(process.env.OPENROUTER_API_BASE_URL);
-  const model = process.env.OPENROUTER_MODEL;
-  const appUrl = process.env.OPENROUTER_APP_URL || undefined;
-  const appTitle = process.env.OPENROUTER_APP_TITLE || undefined;
-  const botName = process.env.BOT_NAME || "SeaTalk Bot";
+  const baseUrl = normalizeBaseUrl(env.OPENROUTER_API_BASE_URL);
+  const model = env.OPENROUTER_MODEL;
+  const appUrl = env.OPENROUTER_APP_URL || undefined;
+  const appTitle = env.OPENROUTER_APP_TITLE || undefined;
+  const botName = env.BOT_NAME || "SeaTalk Bot";
 
   const systemPrompt =
     `You are ${botName}. Answer using the provided sources only. ` +
@@ -64,8 +65,9 @@ async function summarizeWithOpenRouter(question, chunks, sourcesList) {
         max_tokens: 220
       },
       {
+        timeout: options.timeoutMs || env.OPENROUTER_HTTP_TIMEOUT_MS,
         headers: {
-          Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+          Authorization: `Bearer ${env.OPENROUTER_API_KEY}`,
           "HTTP-Referer": appUrl,
           "X-Title": appTitle,
           "Content-Type": "application/json"

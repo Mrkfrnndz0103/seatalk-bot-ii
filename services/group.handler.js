@@ -143,6 +143,11 @@ function isAgeQuestion(text) {
 }
 
 async function sendGroupTextMessage(groupId, content, deps) {
+  if (typeof deps.sendGroupMessage === "function") {
+    await deps.sendGroupMessage(groupId, content);
+    return;
+  }
+
   const apiBaseUrl = deps.apiBaseUrl;
   if (!apiBaseUrl) {
     throw new Error("Missing SEATALK_API_BASE_URL for group messages.");
@@ -203,6 +208,8 @@ async function handleGroupMention(event, deps) {
     const convoReply = await deps.generateReply(msgText, {
       skipSheetContext: true,
       conversation: true,
+      prefetchChatHistory: true,
+      groupId,
       logger: deps.logger,
       requestId: deps.requestId
     });
@@ -252,7 +259,7 @@ async function handleGroupMention(event, deps) {
   const reply = await deps.handleIntentMessage(msgText, {
     sheetCache: deps.sheetCache,
     refreshSheetCache: deps.refreshSheetCache,
-    includeFallback: true,
+    includeFallback: false,
     readSheetRange: deps.readSheetRange
   });
 
@@ -260,6 +267,21 @@ async function handleGroupMention(event, deps) {
     const lead = getPositiveLead();
     const content = lead ? `${lead}\n\n${reply.text}` : reply.text;
     await sendGroupTextMessage(groupId, content, deps);
+    return;
+  }
+
+  if (typeof deps.generateReply === "function") {
+    const fallbackReply = await deps.generateReply(msgText, {
+      skipSheetContext: false,
+      conversation: false,
+      prefetchChatHistory: true,
+      groupId,
+      logger: deps.logger,
+      requestId: deps.requestId
+    });
+    if (fallbackReply) {
+      await sendGroupTextMessage(groupId, fallbackReply, deps);
+    }
   }
 }
 

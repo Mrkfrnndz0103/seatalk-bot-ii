@@ -14,6 +14,9 @@ const DEFAULT_SEARCH_LLM_TIMEOUT_MS = 1800;
 const DEFAULT_SEARCH_LLM_CACHE_TTL_MS = 120 * 1000;
 const DEFAULT_HTTP_TIMEOUT_MS = 8000;
 const DEFAULT_SCHEDULED_INTERVAL_MINUTES = 0;
+const DEFAULT_MCP_TIMEOUT_MS = 10000;
+const DEFAULT_MCP_RETRY_MAX = 3;
+const DEFAULT_MCP_RETRY_BASE_MS = 500;
 
 function parseNonNegativeInt(value, fallback) {
   if (value === undefined || value === null || value === "") {
@@ -77,6 +80,21 @@ const env = {
   SEATALK_HTTP_TIMEOUT_MS: parsePositiveInt(
     process.env.SEATALK_HTTP_TIMEOUT_MS,
     DEFAULT_HTTP_TIMEOUT_MS
+  ),
+  MCP_ENDPOINT: process.env.MCP_ENDPOINT || "",
+  MCP_TRANSPORT: String(process.env.MCP_TRANSPORT || "auto").toLowerCase(),
+  MCP_SERVER_NAME: process.env.MCP_SERVER_NAME || "seatalk-mcp-server",
+  MCP_TIMEOUT_MS: parsePositiveInt(
+    process.env.MCP_TIMEOUT_MS,
+    DEFAULT_MCP_TIMEOUT_MS
+  ),
+  MCP_RETRY_MAX: parsePositiveInt(
+    process.env.MCP_RETRY_MAX,
+    DEFAULT_MCP_RETRY_MAX
+  ),
+  MCP_RETRY_BASE_MS: parsePositiveInt(
+    process.env.MCP_RETRY_BASE_MS,
+    DEFAULT_MCP_RETRY_BASE_MS
   ),
   OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY || "",
   OPENROUTER_MODEL: process.env.OPENROUTER_MODEL || "",

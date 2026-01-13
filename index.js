@@ -19,6 +19,10 @@ const { isValidSignature, getSignatureHeader } = require("./utils/signature");
 const { BotEventType } = require("./events/event.types");
 const { mapSeatalkEventType } = require("./events/event.mapper");
 const { trackEvent } = require("./events/event.tracker");
+const { SeatalkMcpClient } = require("./integrations/seatalk.mcp.client");
+const { createSeatalkMcpTools } = require("./integrations/seatalk.mcp.tools");
+const { createLlmAgent } = require("./services/llm.agent");
+const { shouldUseEmployeeLookup } = require("./services/llm.tool.policy");
 
 const app = express();
 const rateLimitState = new Map();
@@ -135,6 +139,41 @@ const SHEETS_MAX_TABS = env.SHEETS_MAX_TABS;
 const SHEETS_REFRESH_MINUTES = env.SHEETS_REFRESH_MINUTES;
 const SHEETS_MAX_MATCH_LINES = env.SHEETS_MAX_MATCH_LINES;
 const SHEETS_MAX_CONTEXT_CHARS = env.SHEETS_MAX_CONTEXT_CHARS;
+const MCP_ENDPOINT = env.MCP_ENDPOINT;
+const MCP_TRANSPORT = env.MCP_TRANSPORT;
+const MCP_SERVER_NAME = env.MCP_SERVER_NAME;
+const MCP_TIMEOUT_MS = env.MCP_TIMEOUT_MS;
+const MCP_RETRY_MAX = env.MCP_RETRY_MAX;
+const MCP_RETRY_BASE_MS = env.MCP_RETRY_BASE_MS;
+
+const seatalkMcpClient = new SeatalkMcpClient({
+  endpoint: MCP_ENDPOINT,
+  transport: MCP_TRANSPORT,
+  serverName: MCP_SERVER_NAME,
+  spawnEnv: {
+    SEATALK_APP_ID,
+    SEATALK_APP_SECRET
+  },
+  timeoutMs: MCP_TIMEOUT_MS,
+  retryMax: MCP_RETRY_MAX,
+  retryBaseMs: MCP_RETRY_BASE_MS,
+  logger
+});
+
+const seatalkMcpTools = createSeatalkMcpTools(seatalkMcpClient, logger);
+
+const llmAgent = createLlmAgent({
+  apiKey: OPENROUTER_API_KEY,
+  model: OPENROUTER_MODEL,
+  baseUrl: OPENROUTER_API_BASE_URL,
+  appUrl: OPENROUTER_APP_URL,
+  appTitle: OPENROUTER_APP_TITLE,
+  timeoutMs: env.OPENROUTER_HTTP_TIMEOUT_MS,
+  botName: BOT_NAME,
+  toolDefinitions: seatalkMcpTools.definitions,
+  toolHandlers: seatalkMcpTools.tools,
+  logger
+});
 
 // ======================
 // Event types
@@ -754,7 +793,90 @@ function extractDisplayName(profile) {
   return null;
 }
 
+function extractEmail(profile) {
+  if (!profile) {
+    return null;
+  }
+
+  const candidates = [
+    profile.company_email,
+    profile.email,
+    profile.companyEmail,
+    profile.user?.email,
+    profile.employee?.email
+  ];
+
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.trim()) {
+      return candidate.trim();
+    }
+  }
+
+  return null;
+}
+
+function resolveEmployeeCode(result, email) {
+  const results = result?.results || [];
+  const match = results.find(
+    (entry) =>
+      entry?.exists &&
+      String(entry.email || "").toLowerCase() === String(email || "").toLowerCase()
+  );
+  if (match?.employee_code) {
+    return match.employee_code;
+  }
+  const first = results.find((entry) => entry?.exists && entry?.employee_code);
+  return first?.employee_code || null;
+}
+
+async function fetchSeatalkProfileViaMcp(event) {
+  if (!seatalkMcpTools) {
+    return null;
+  }
+
+  const identity = getSeatalkIdentity(event);
+  let employeeCode = identity.employee_code || null;
+
+  if (!employeeCode && identity.email) {
+    const lookup = await seatalkMcpTools.tools.get_employee_code_with_email({
+      emails: [identity.email]
+    });
+    if (lookup?.code === 0) {
+      employeeCode = resolveEmployeeCode(lookup, identity.email);
+    }
+  }
+
+  if (!employeeCode) {
+    return null;
+  }
+
+  const response = await seatalkMcpTools.tools.get_employee_profile({
+    employee_code: employeeCode
+  });
+  if (response?.code !== 0) {
+    return null;
+  }
+
+  const profile = response.employee || response.profile || response.data;
+  return {
+    name: extractDisplayName(profile),
+    gender: extractGender(profile),
+    email: extractEmail(profile)
+  };
+}
+
 async function fetchSeatalkProfile(event) {
+  if (seatalkMcpTools) {
+    try {
+      const profile = await fetchSeatalkProfileViaMcp(event);
+      if (profile?.name) {
+        return profile;
+      }
+    } catch (error) {
+      console.warn("MCP profile lookup failed:", error.message);
+    }
+  }
+
   if (!SEATALK_PROFILE_URL) {
     return null;
   }
@@ -784,7 +906,8 @@ async function fetchSeatalkProfile(event) {
     const data = response.data?.data ?? response.data;
     return {
       name: extractDisplayName(data),
-      gender: extractGender(data)
+      gender: extractGender(data),
+      email: extractEmail(data)
     };
   } catch (error) {
     console.warn(
@@ -1402,77 +1525,27 @@ function buildTabSuggestionReply(suggestions) {
 }
 
 async function generateIntelligentReply(userMessage, options = {}) {
-  if (!OPENROUTER_API_KEY || !OPENROUTER_MODEL) {
-    return "Thanks for your message.";
-  }
-
-  const systemPrompt = options.conversation
-    ? `You are ${BOT_NAME}, a friendly SeaTalk bot. Respond naturally and concisely (1-3 sentences).`
-    : `You are ${BOT_NAME}, a helpful SeaTalk bot. Respond intelligently, short, and concise (1-3 sentences). Do not include greetings. ` +
-      "If the request is about backlogs, top contributors by region, or truck requests, answer using the provided sheet context. " +
-      "If it is unclear or does not match, ask one brief clarifying question and give one example query.";
   const sheetContext = options.skipSheetContext
     ? ""
     : buildSheetContext(userMessage, {
         preferredTab: options.preferredTab
       });
-  const messages = [{ role: "system", content: systemPrompt }];
 
+  let extraSystemContext = "";
   if (options.preferredTab) {
     const label = options.preferredTab.spreadsheetTitle
       ? `${options.preferredTab.tabName} - ${options.preferredTab.spreadsheetTitle}`
       : options.preferredTab.tabName;
-    messages.push({
-      role: "system",
-      content: `Use data from the "${label}" tab only.`
-    });
+    extraSystemContext = `Use data from the "${label}" tab only.`;
   }
 
-  if (sheetContext) {
-    messages.push({
-      role: "system",
-      content: `Context from team sheets (partial, may be outdated):\n${sheetContext}`
-    });
-  }
-
-  try {
-    const startedAt = Date.now();
-    const response = await axios.post(
-      `${OPENROUTER_API_BASE_URL}/chat/completions`,
-      {
-        model: OPENROUTER_MODEL,
-        messages: [...messages, { role: "user", content: userMessage }],
-        temperature: 0.3,
-        max_tokens: 120
-      },
-      {
-        timeout: options.timeoutMs || env.OPENROUTER_HTTP_TIMEOUT_MS,
-        headers: {
-          Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-          "HTTP-Referer": OPENROUTER_APP_URL || undefined,
-          "X-Title": OPENROUTER_APP_TITLE || undefined,
-          "Content-Type": "application/json"
-        }
-      }
-    );
-
-    if (options.logger && typeof options.logger.info === "function") {
-      const payload = { ms: Date.now() - startedAt };
-      if (options.requestId) {
-        payload.requestId = options.requestId;
-      }
-      options.logger.info("llm_reply_ms", payload);
-    }
-
-    const reply = response.data?.choices?.[0]?.message?.content?.trim();
-    return reply || "Thanks for your message.";
-  } catch (error) {
-    console.error(
-      "OpenRouter reply failed:",
-      error.response?.data || error.message
-    );
-    return "Thanks for your message.";
-  }
+  return llmAgent.generateReply(userMessage, {
+    conversation: options.conversation,
+    sheetContext,
+    extraSystemContext,
+    prefetchChatHistory: options.prefetchChatHistory,
+    groupId: options.groupId
+  });
 }
 
 async function handleSubscriberMessage(event, ctx = {}) {
@@ -1596,6 +1669,15 @@ async function handleSubscriberMessage(event, ctx = {}) {
       return;
     }
 
+    if (shouldUseEmployeeLookup(msgText)) {
+      const lookupReply = await generateIntelligentReply(msgText, {
+        skipSheetContext: true,
+        conversation: false
+      });
+      await replyWithText(lookupReply || "I couldn't find that employee.");
+      return;
+    }
+
     const loadedIndex = Array.isArray(indexStore.items) ? indexStore.items : [];
     if (!loadedIndex.length) {
       await replyWithText("Index is empty. Run /reindex to build it.");
@@ -1650,18 +1732,44 @@ async function handleSubscriberMessage(event, ctx = {}) {
 
 // Send text message to subscriber
 async function replyToSubscriber(employee_code, content) {
+  const messagePayload = {
+    tag: "text",
+    text: {
+      format: 1, // 1 = markdown, 2 = plain text
+      content: content
+    }
+  };
+
+  if (seatalkMcpTools) {
+    try {
+      const response = await seatalkMcpTools.sendMessageToBotUser(
+        employee_code,
+        messagePayload
+      );
+      if (response?.code === 0) {
+        console.log("Message sent successfully:", response.message_id);
+        return;
+      }
+      if (response?.code) {
+        console.error(
+          "MCP send message failed:",
+          response
+        );
+      }
+    } catch (error) {
+      console.error(
+        "MCP send message error:",
+        error.message || error
+      );
+    }
+  }
+
   try {
     const response = await postWithAuth(
       `${SEATALK_API_BASE_URL}/messaging/v2/single_chat`,
       {
         employee_code: employee_code,
-        message: {
-          tag: "text",
-          text: {
-            format: 1, // 1 = markdown, 2 = plain text
-            content: content
-          }
-        },
+        message: messagePayload,
         usable_platform: "all"
       }
     );
@@ -1677,18 +1785,44 @@ async function replyToSubscriber(employee_code, content) {
 }
 
 async function sendGroupMessage(group_id, content) {
+  const messagePayload = {
+    tag: "text",
+    text: {
+      format: 1,
+      content
+    }
+  };
+
+  if (seatalkMcpTools) {
+    try {
+      const response = await seatalkMcpTools.sendMessageToGroupChat(
+        group_id,
+        messagePayload
+      );
+      if (response?.code === 0) {
+        console.log("Group message sent successfully:", response.message_id);
+        return;
+      }
+      if (response?.code) {
+        console.error(
+          "MCP send group message failed:",
+          response
+        );
+      }
+    } catch (error) {
+      console.error(
+        "MCP send group message error:",
+        error.message || error
+      );
+    }
+  }
+
   try {
     const response = await postWithAuth(
       `${SEATALK_API_BASE_URL}/messaging/v2/group_chat`,
       {
         group_id,
-        message: {
-          tag: "text",
-          text: {
-            format: 1,
-            content
-          }
-        },
+        message: messagePayload,
         usable_platform: "all"
       }
     );
@@ -1987,6 +2121,7 @@ app.post("/seatalk/callback", (req, res) => {
             requestId,
             logger,
             readSheetRange,
+            sendGroupMessage,
             postWithAuth,
             apiBaseUrl: SEATALK_API_BASE_URL
           })
@@ -2029,4 +2164,6 @@ const PORT = env.PORT;
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
 });
+
+
 

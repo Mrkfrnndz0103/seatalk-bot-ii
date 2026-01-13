@@ -594,7 +594,7 @@ async function handleBacklogsIntent(message, sheets, options = {}) {
 
   if (clusterLines.length) {
     const bulleted = clusterLines.map((line) => `- ${line}`);
-    lines.push("", "**Top 3 Contributor's:**", ...bulleted);
+    lines.push("", "Top 3 Contributor's:", ...bulleted);
   }
 
   const numericBacklogs = parseNumber(backlogsValue);

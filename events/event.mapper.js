@@ -62,8 +62,33 @@ function mapSeatalkEventType(eventType, event) {
     case "bot_removed_from_group_chat":
       return [BotEventType.PERMISSION_CHANGE, BotEventType.USER_LEAVE];
     default:
-      return [];
+      break;
   }
+
+  const normalized = normalize(eventType);
+  if (
+    normalized.includes("user_join") ||
+    normalized.includes("user_added") ||
+    normalized.includes("user_enter")
+  ) {
+    return [BotEventType.USER_JOIN];
+  }
+  if (
+    normalized.includes("user_leave") ||
+    normalized.includes("user_removed") ||
+    normalized.includes("user_exit")
+  ) {
+    return [BotEventType.USER_LEAVE];
+  }
+  if (
+    normalized.includes("permission") ||
+    normalized.includes("role_change") ||
+    normalized.includes("scope_change")
+  ) {
+    return [BotEventType.PERMISSION_CHANGE];
+  }
+
+  return [];
 }
 
 module.exports = {

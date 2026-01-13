@@ -44,7 +44,34 @@ function parseDateTime(value) {
   }
 
   const parsed = Date.parse(raw);
-  return Number.isNaN(parsed) ? null : parsed;
+  if (!Number.isNaN(parsed)) {
+    return parsed;
+  }
+
+  const normalized = raw.toLowerCase().replace(/\s+/g, "");
+  const ampmMatch = normalized.match(/^(\d{1,2})(?::(\d{2}))?(am|pm)$/i);
+  if (ampmMatch) {
+    let hours = Number(ampmMatch[1]);
+    const minutes = Number(ampmMatch[2] || 0);
+    const meridiem = ampmMatch[3].toLowerCase();
+    if (hours === 12) {
+      hours = meridiem === "am" ? 0 : 12;
+    } else if (meridiem === "pm") {
+      hours += 12;
+    }
+    return hours * 60 + minutes;
+  }
+
+  const timeMatch = normalized.match(/^(\d{1,2}):(\d{2})$/);
+  if (timeMatch) {
+    const hours = Number(timeMatch[1]);
+    const minutes = Number(timeMatch[2]);
+    if (hours >= 0 && hours <= 23 && minutes >= 0 && minutes <= 59) {
+      return hours * 60 + minutes;
+    }
+  }
+
+  return null;
 }
 
 function colLetterToIndex(letter) {
@@ -135,8 +162,7 @@ function matchValueFromMessage(message, values) {
 
 function buildClarifyingReply() {
   return (
-    "I can help with backlogs, top contributors by region, or truck requests. " +
-    "Which one do you need? Example: \"top contributors for NCR\"."
+    "....."
   );
 }
 
@@ -234,6 +260,220 @@ function extractContributors(rows, offset) {
   return entries;
 }
 
+function buildTopContributorLines(rows, offset) {
+  const labels = [
+    "GMA SOL",
+    "SOL IIS",
+    "SOL",
+    "InterSOC",
+    "MM/GMA",
+    "RC",
+    "Mindanao"
+  ];
+
+  const regionMap = new Map();
+  for (let rowNumber = 2; rowNumber <= 8; rowNumber += 1) {
+    const region = getCell(rows, rowNumber, "I", offset);
+    if (!region) {
+      continue;
+    }
+    const hub = getCell(rows, rowNumber, "J", offset);
+    const pending = getCell(rows, rowNumber, "K", offset);
+    let resolvedHub = hub;
+    let resolvedPending = pending;
+
+    if (!resolvedPending && parseNumber(resolvedHub) !== null) {
+      resolvedPending = resolvedHub;
+      resolvedHub = region;
+    }
+
+    regionMap.set(normalizeText(region), {
+      hub: resolvedHub,
+      pending: resolvedPending
+    });
+  }
+
+  return labels.map((label, index) => {
+    const key = normalizeText(label);
+    const mapped = regionMap.get(key);
+    let hub = mapped?.hub || "";
+    let pending = mapped?.pending || "";
+
+    if (!hub && !pending) {
+      const rowNumber = 2 + index;
+      hub = getCell(rows, rowNumber, "J", offset) || "";
+      pending = getCell(rows, rowNumber, "K", offset) || "";
+    }
+
+    return `${label} - ${hub || "N/A"} : ${pending || "N/A"}`;
+  });
+}
+
+function pickRandom(values) {
+  if (!values.length) {
+    return "";
+  }
+  const index = Math.floor(Math.random() * values.length);
+  return values[index];
+}
+
+function normalizeRegion(value) {
+  return normalizeText(value).replace(/\s+/g, "");
+}
+
+function buildTopContributorLinesFromRange(values) {
+  const labels = [
+    "GMA SOL",
+    "SOL IIS",
+    "SOL",
+    "InterSOC",
+    "MM/GMA",
+    "RC",
+    "Mindanao"
+  ];
+
+  const rows = (values || []).map((row) => row || []);
+  const regionMap = new Map();
+  rows.forEach((row) => {
+    const region = row[0];
+    if (!region) {
+      return;
+    }
+    let hub = row[1] || "";
+    let pending = row[2] || "";
+    if (!pending && parseNumber(hub) !== null) {
+      pending = hub;
+      hub = region;
+    }
+    regionMap.set(normalizeRegion(region), { hub, pending });
+  });
+
+  return labels.map((label) => {
+    const mapped = regionMap.get(normalizeRegion(label));
+    const hub = mapped?.hub || "N/A";
+    const pending = mapped?.pending || "N/A";
+    return `${label} - ${hub} : ${pending}`;
+  });
+}
+
+function buildContributorEntriesFromRange(values) {
+  const rows = (values || []).map((row) => row || []);
+  return rows
+    .map((row) => {
+      const region = row[0] || "";
+      let hub = row[1] || "";
+      let pendingRaw = row[2] || "";
+      let pending = parseNumber(pendingRaw);
+
+      if (!pendingRaw && parseNumber(hub) !== null) {
+        pendingRaw = hub;
+        pending = parseNumber(hub);
+        hub = region;
+      }
+
+      return {
+        region,
+        hub,
+        pending,
+        pendingRaw
+      };
+    })
+    .filter((entry) => entry.region || entry.hub || entry.pendingRaw);
+}
+
+function findHighestContributor(values) {
+  let best = null;
+  values.forEach((row) => {
+    const region = row?.[0] || "";
+    const pendingRaw = row?.[1] || "";
+    if (!region) {
+      return;
+    }
+    const pending = parseNumber(pendingRaw);
+    if (pending === null) {
+      return;
+    }
+    if (!best || pending > best.pending) {
+      best = { region, pending, pendingRaw: String(pendingRaw) };
+    }
+  });
+
+  if (best) {
+    return best;
+  }
+
+  for (const row of values || []) {
+    const region = row?.[0] || "";
+    const pendingRaw = row?.[1] || "";
+    if (region && pendingRaw) {
+      return { region, pending: null, pendingRaw: String(pendingRaw) };
+    }
+  }
+
+  return null;
+}
+
+function getClusterRangeForRegion(region) {
+  const key = normalizeRegion(region);
+  const ranges = {
+    intersoc: "J33:K35",
+    rc: "J58:K59",
+    mmgma: "J17:K19",
+    gma: "J39:K41",
+    gmasol: "J39:K41",
+    sol: "J25:K27",
+    soliis: "J47:K49",
+    mindanao: "J55:K56",
+    vismin: "J55:K56"
+  };
+  return ranges[key] || "";
+}
+
+function buildClusterLines(values) {
+  const lines = [];
+  (values || []).forEach((row) => {
+    const cluster = row?.[0] || "";
+    const pending = row?.[1] || "";
+    if (!cluster && !pending) {
+      return;
+    }
+    lines.push(`${cluster || "N/A"} - ${pending || "N/A"}`);
+  });
+  return lines;
+}
+
+function buildClusterLinesFromRows(rows, offset, startRow, endRow) {
+  const lines = [];
+  for (let rowNumber = startRow; rowNumber <= endRow; rowNumber += 1) {
+    const cluster = getCell(rows, rowNumber, "J", offset);
+    const pending = getCell(rows, rowNumber, "K", offset);
+    if (!cluster && !pending) {
+      continue;
+    }
+    lines.push(`${cluster || "N/A"} - ${pending || "N/A"}`);
+  }
+  return lines;
+}
+
+function extractTopContributorFromRows(rows, offset) {
+  let best = null;
+  for (let rowNumber = 2; rowNumber <= 8; rowNumber += 1) {
+    const region = getCell(rows, rowNumber, "I", offset);
+    const pendingRaw = getCell(rows, rowNumber, "J", offset);
+    if (!region) {
+      continue;
+    }
+    const pending = parseNumber(pendingRaw);
+    if (pending === null) {
+      continue;
+    }
+    if (!best || pending > best.pending) {
+      best = { region, pending, pendingRaw: String(pendingRaw) };
+    }
+  }
+  return best;
+}
+
 function formatPending(entry) {
   if (entry.pending !== null) {
     return entry.pending;
@@ -259,69 +499,162 @@ function buildTopContributorsLines(entries) {
   return lines.filter(Boolean);
 }
 
-function handleBacklogsIntent(message, sheets) {
+async function handleBacklogsIntent(message, sheets, options = {}) {
   const backlogsSheet =
     findSheetByTab(sheets, BACKLOGS_TAB_NAME, DATA_SHEET_ID) ||
     findSheetByTab(sheets, BACKLOGS_TAB_NAME, null);
-  if (!backlogsSheet) {
+
+  let rows = [];
+  let offset = 0;
+  let topContributor = null;
+  let clusterLines = [];
+  let refreshTs = "";
+  let backlogsValue = "N/A";
+
+  if (backlogsSheet) {
+    rows = getSheetRows(backlogsSheet);
+    offset = getColumnOffset(rows);
+    refreshTs = getCell(rows, 10, "J", offset);
+    backlogsValue = getCell(rows, 11, "J", offset) || "N/A";
+  }
+
+  if (typeof options.readSheetRange === "function") {
+    try {
+      const tabName = BACKLOGS_TAB_NAME;
+      const spreadsheetId = DATA_SHEET_ID;
+      const summaryValues = await options.readSheetRange(
+        spreadsheetId,
+        `${tabName}!J10:J11`
+      );
+      if (Array.isArray(summaryValues)) {
+        refreshTs = summaryValues[0]?.[0] || refreshTs;
+        backlogsValue = summaryValues[1]?.[0] || backlogsValue;
+      }
+
+      const contributorsValues = await options.readSheetRange(
+        spreadsheetId,
+        `${tabName}!I2:J8`
+      );
+      if (Array.isArray(contributorsValues) && contributorsValues.length) {
+        topContributor = findHighestContributor(contributorsValues);
+      }
+
+      if (topContributor) {
+        const clusterRange = getClusterRangeForRegion(topContributor.region);
+        if (clusterRange) {
+          const clusters = await options.readSheetRange(
+            spreadsheetId,
+            `${tabName}!${clusterRange}`
+          );
+          clusterLines = buildClusterLines(clusters);
+        }
+      }
+    } catch (error) {
+      // Fallback to cached sheet values if API read fails.
+    }
+  }
+
+  if (!topContributor && rows.length) {
+    topContributor = extractTopContributorFromRows(rows, offset);
+  }
+
+  if (topContributor && !clusterLines.length && rows.length) {
+    const range = getClusterRangeForRegion(topContributor.region);
+    const match = range.match(/J(\d+):K(\d+)/i);
+    if (match) {
+      const startRow = Number(match[1]);
+      const endRow = Number(match[2]);
+      if (Number.isFinite(startRow) && Number.isFinite(endRow)) {
+        clusterLines = buildClusterLinesFromRows(rows, offset, startRow, endRow);
+      }
+    }
+  }
+
+  if (!topContributor && backlogsValue === "N/A") {
     return {
       text: "I couldn't find the backlogs tab yet. Please check the sheet list."
     };
   }
 
-  const imageSheet =
-    findSheetByTab(sheets, BACKLOGS_IMAGE_TAB_NAME, BACKLOGS_IMAGE_SHEET_ID) ||
-    findSheetByTab(sheets, BACKLOGS_IMAGE_TAB_NAME, null);
+  const asOf = refreshTs || "now";
+  const lines = [
+    "**BACKLOGS Summary**",
+    `> ${backlogsValue} <`,
+    `as of ${asOf}`,
+    "",
+    "**Top Contributor**"
+  ];
 
-  const rows = getSheetRows(backlogsSheet);
-  const offset = getColumnOffset(rows);
-  const summary = buildBacklogsSummary(rows, offset);
-  const entries = extractContributors(rows, offset);
-  const topLines = buildTopContributorsLines(entries);
-  const pngUrl = buildSheetPngUrl(imageSheet || backlogsSheet);
-
-  const timestamp = summary.dataAsOf || summary.refresh || "now";
-  const backlogsValue =
-    summary.totalBacklogs || summary.totalPending || "N/A";
-  const lines = [];
-  if (pngUrl) {
-    lines.push(`![Backlogs Summary](${pngUrl})`);
-  }
-
-  lines.push(
-    `As of ${timestamp}, the current backlogs is ${backlogsValue}.`
-  );
-
-  if (summary.totalDispatch) {
-    lines.push(`Total dispatch: ${summary.totalDispatch}`);
-  }
-  if (summary.latestPackedTime) {
-    lines.push(`Latest packed time: ${summary.latestPackedTime}`);
-  }
-
-  if (topLines.length > 1) {
-    lines.push("Top contributors:");
-    lines.push(...topLines);
+  if (topContributor) {
+    const pendingDisplay = topContributor.pendingRaw || "N/A";
+    lines.push(`> **${topContributor.region} at ${pendingDisplay}**`);
   } else {
-    lines.push("Top contributors data is not available.");
+    lines.push("> **N/A**");
+  }
+
+  if (clusterLines.length) {
+    const bulleted = clusterLines.map((line) => `- ${line}`);
+    lines.push("", "**Top 3 Contributor's:**", ...bulleted);
+  }
+
+  const numericBacklogs = parseNumber(backlogsValue);
+  if (numericBacklogs !== null) {
+    const highRange = [
+      "\u{1F62E} Okay, that\u2019s higher than expected",
+      "\u{1F605} \u201CManageable\u201D is starting to feel optimistic",
+      "\u{1F62C} Alright\u2026 this needs attention",
+      "\u{1F631} That\u2019s a spicy number",
+      "\u{1F62C} \u201CManageable\u201D has left the chat",
+      "\u{1F6A8} This is getting interesting now."
+    ];
+    const lowRange = [
+      "\u{1F60C} All good \u2014 barely breaking a sweat.",
+      "\u{1F642} Looking okay\u2026 keeping an eye on it.",
+      "\u{1F914} Hmm\u2026 seems manageable for now.",
+      "\u{1F642} Still within acceptable range",
+      "\u{1F642} Looking healthy",
+      "\u{1F60C} All good \u2014 no surprises"
+    ];
+    const ladder =
+      numericBacklogs >= 100000 ? pickRandom(highRange) : pickRandom(lowRange);
+    if (ladder) {
+      lines.push("", ladder);
+    }
   }
 
   return { text: lines.join("\n") };
 }
 
-function handleTopContributorsIntent(message, sheets) {
-  const sheet =
-    findSheetByTab(sheets, BACKLOGS_TAB_NAME, DATA_SHEET_ID) ||
-    findSheetByTab(sheets, BACKLOGS_TAB_NAME, null);
-  if (!sheet) {
-    return {
-      text: "I couldn't find top contributors yet."
-    };
+async function handleTopContributorsIntent(message, sheets, options = {}) {
+  let entries = [];
+
+  if (typeof options.readSheetRange === "function") {
+    try {
+      const values = await options.readSheetRange(
+        DATA_SHEET_ID,
+        `${BACKLOGS_TAB_NAME}!I2:K8`
+      );
+      entries = buildContributorEntriesFromRange(values);
+    } catch (error) {
+      // fallback to cached sheet values
+    }
   }
 
-  const rows = getSheetRows(sheet);
-  const offset = getColumnOffset(rows);
-  const entries = extractContributors(rows, offset);
+  if (!entries.length) {
+    const sheet =
+      findSheetByTab(sheets, BACKLOGS_TAB_NAME, DATA_SHEET_ID) ||
+      findSheetByTab(sheets, BACKLOGS_TAB_NAME, null);
+    if (!sheet) {
+      return {
+        text: "I couldn't find top contributors yet."
+      };
+    }
+
+    const rows = getSheetRows(sheet);
+    const offset = getColumnOffset(rows);
+    entries = extractContributors(rows, offset);
+  }
+
   if (!entries.length) {
     return { text: "Top contributors data is unavailable." };
   }
@@ -418,19 +751,76 @@ function extractTruckRequests(rows, offset) {
   return entries;
 }
 
-function handleTruckRequestIntent(message, sheets) {
-  const sheet =
-    findSheetByTab(sheets, TRUCK_TAB_NAME, DATA_SHEET_ID) ||
-    findSheetByTab(sheets, TRUCK_TAB_NAME, null);
-  if (!sheet) {
-    return {
-      text: "I couldn't find the truck request yet."
-    };
+function extractTruckRequestsFromRange(values) {
+  const entries = [];
+  const rows = (values || []).map((row) => row || []);
+  rows.forEach((row, index) => {
+    const requestTime = row[0] || "";
+    const cluster = row[1] || "";
+    const truckSize = row[2] || "";
+    const requestedBy = row[3] || "";
+    const plate = row[4] || "";
+    const provideTime = row[7] || "";
+    const lhTrip = row[9] || "";
+
+    if (
+      !requestTime &&
+      !cluster &&
+      !truckSize &&
+      !requestedBy &&
+      !plate &&
+      !provideTime &&
+      !lhTrip
+    ) {
+      return;
+    }
+
+    entries.push({
+      cluster,
+      requestTime,
+      truckSize,
+      requestedBy,
+      plate,
+      provideTime,
+      lhTrip,
+      timestamp: parseDateTime(requestTime),
+      rowNumber: index + 3
+    });
+  });
+
+  return entries;
+}
+
+async function handleTruckRequestIntent(message, sheets, options = {}) {
+  let entries = [];
+
+  if (typeof options.readSheetRange === "function") {
+    try {
+      const values = await options.readSheetRange(
+        DATA_SHEET_ID,
+        `${TRUCK_TAB_NAME}!B3:K`
+      );
+      entries = extractTruckRequestsFromRange(values);
+    } catch (error) {
+      // fallback to cached sheet values
+    }
   }
 
-  const rows = getSheetRows(sheet);
-  const offset = getColumnOffset(rows);
-  const entries = extractTruckRequests(rows, offset);
+  if (!entries.length) {
+    const sheet =
+      findSheetByTab(sheets, TRUCK_TAB_NAME, DATA_SHEET_ID) ||
+      findSheetByTab(sheets, TRUCK_TAB_NAME, null);
+    if (!sheet) {
+      return {
+        text: "I couldn't find the truck request yet."
+      };
+    }
+
+    const rows = getSheetRows(sheet);
+    const offset = getColumnOffset(rows);
+    entries = extractTruckRequests(rows, offset);
+  }
+
   if (!entries.length) {
     return { text: "Truck request data is unavailable as of this time." };
   }
@@ -505,24 +895,41 @@ function handleTruckRequestIntent(message, sheets) {
     if (wantsProvide) {
       parts.push(`Provide time: ${entry.provideTime || "Not set"}`);
     }
-    return {
-      text: `Latest request for ${entry.cluster}.\n${parts.join("\n")}`
-    };
+
+    const lines = [
+      "Latest request for:",
+      `> **${entry.cluster}**`
+    ];
+    if (parts.length) {
+      lines.push("", parts.join("\n"));
+    }
+
+    return { text: lines.join("\n") };
   }
 
   const lines = [
-    `Latest request for ${entry.cluster}:`,
-    `Status: ${status}`,
-    `Requested by: ${entry.requestedBy || "Unknown"}`,
-    `LHTrip: ${entry.lhTrip || "Unknown"}`,
-    `Truck size: ${entry.truckSize || "Unknown"}`,
-    `Plate #: ${plateText}`
+    "Latest request for:",
+    `> **${entry.cluster}**`
   ];
+  if (entry.requestTime) {
+    lines.push("", `Request time: ${entry.requestTime}`);
+  }
+  lines.push(
+    "",
+    `Status: ${status}`,
+    `Requested by: ${entry.requestedBy || "Unknown"}`
+  );
+  if (entry.lhTrip) {
+    lines.push(`LHTrip: ${entry.lhTrip || "Unknown"}`);
+  }
+  if (entry.truckSize) {
+    lines.push(`Truck size: ${entry.truckSize || "Unknown"}`);
+  }
+  if (plateText) {
+    lines.push(`Plate #: ${plateText}`);
+  }
   if (entry.provideTime) {
     lines.push(`Provide time: ${entry.provideTime}`);
-  }
-  if (entry.requestTime) {
-    lines.push(`Request time: ${entry.requestTime}`);
   }
 
   return { text: lines.join("\n") };
@@ -546,7 +953,8 @@ async function handleIntentMessage(message, options = {}) {
   }
 
   const sheets = options.sheetCache?.sheets || [];
-  if (!sheets.length) {
+  const hasDirectRead = typeof options.readSheetRange === "function";
+  if (!sheets.length && !hasDirectRead) {
     return {
       text: "Data Team is ongoing Please try again in a moment."
     };
@@ -554,11 +962,11 @@ async function handleIntentMessage(message, options = {}) {
 
   switch (intent) {
     case "backlogs":
-      return handleBacklogsIntent(message, sheets);
+      return await handleBacklogsIntent(message, sheets, options);
     case "contributors":
-      return handleTopContributorsIntent(message, sheets);
+      return await handleTopContributorsIntent(message, sheets, options);
     case "truck":
-      return handleTruckRequestIntent(message, sheets);
+      return await handleTruckRequestIntent(message, sheets, options);
     default:
       return null;
   }
@@ -569,3 +977,5 @@ module.exports = {
   detectIntent,
   handleIntentMessage
 };
+
+

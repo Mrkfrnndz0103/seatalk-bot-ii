@@ -31,6 +31,12 @@ npm start
 - `GET /health` -> always OK
 - `GET /ready` -> checks env + index loaded
 
+## Event Hooks
+
+- `POST /seatalk/notify` -> signed notification push (provide `group_id` or `employee_code`)
+- `POST /v1/bot/events` -> generic event ingest (see `docs/seatalk_events.md`)
+- `SCHEDULED_INTERVAL_MINUTES` -> emits scheduled events to logs at a fixed interval
+
 ## Env Vars
 
 Required:

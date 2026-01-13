@@ -2,7 +2,12 @@ const { BotEventType } = require("./event.types");
 const { getThreadId } = require("./event.mapper");
 
 function getMessageText(event) {
+  if (typeof event?.message?.text === "string") {
+    return event.message.text;
+  }
+
   return (
+    event?.message?.text?.plain_text ||
     event?.message?.text?.content ||
     event?.message?.text?.text ||
     event?.message?.content ||
@@ -23,6 +28,7 @@ function buildEventPayload({ type, requestId, seatalkEventType, event, details }
     (event?.group_id ? "group" : "dm");
   const threadId = getThreadId(event);
   const messageId = event?.message?.message_id || event?.message_id || null;
+  const eventId = event?.event_id || event?.eventId || null;
   const actor = event?.actor || null;
   const text = getMessageText(event);
 
@@ -30,6 +36,7 @@ function buildEventPayload({ type, requestId, seatalkEventType, event, details }
     type: type || BotEventType.ERROR,
     requestId: requestId || "unknown",
     seatalkEventType: seatalkEventType || "unknown",
+    eventId,
     chatId,
     chatType,
     threadId,

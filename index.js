@@ -79,6 +79,14 @@ function trackSystemEvent(type, details) {
   });
 }
 
+function resolveBotEventType(value) {
+  const normalized = String(value || "").toUpperCase().trim();
+  if (Object.values(BotEventType).includes(normalized)) {
+    return normalized;
+  }
+  return BotEventType.ERROR;
+}
+
 app.use(
   express.json({
     verify: rawBodySaver,
@@ -342,25 +350,46 @@ function toTitleCase(value) {
     .join(" ");
 }
 
+function getSeatalkIdentity(event) {
+  const sender = event?.sender || event?.message?.sender || null;
+  return {
+    seatalk_id: event?.seatalk_id || sender?.seatalk_id || null,
+    employee_code: event?.employee_code || sender?.employee_code || null,
+    email: event?.email || sender?.email || null
+  };
+}
+
 function formatUserName(event) {
   if (event?.name) {
     return event.name;
   }
 
-  if (event?.email) {
-    const localPart = String(event.email).split("@")[0] || "";
+  const sender = event?.sender || event?.message?.sender;
+  const senderName =
+    sender?.name ||
+    sender?.display_name ||
+    sender?.displayName ||
+    sender?.full_name ||
+    sender?.fullName;
+  if (senderName) {
+    return senderName;
+  }
+
+  const identity = getSeatalkIdentity(event);
+  if (identity.email) {
+    const localPart = String(identity.email).split("@")[0] || "";
     const cleaned = localPart.replace(/[._-]+/g, " ").trim();
     if (cleaned) {
       return toTitleCase(cleaned);
     }
   }
 
-  if (event?.employee_code) {
-    return `Employee ${event.employee_code}`;
+  if (identity.employee_code) {
+    return `Employee ${identity.employee_code}`;
   }
 
-  if (event?.seatalk_id) {
-    return `User ${event.seatalk_id}`;
+  if (identity.seatalk_id) {
+    return `User ${identity.seatalk_id}`;
   }
 
   return "there";
@@ -374,9 +403,189 @@ function formatFirstName(value) {
   return cleaned.split(/\s+/)[0];
 }
 
-function buildGreeting(event) {
-  const firstName = formatFirstName(formatUserName(event));
-  return `Hi ${firstName} 👋 How can I help you today?`;
+function buildGreetingFromName(name) {
+  const firstName = formatFirstName(name);
+  return `Hello ${firstName} \u{1F44B} How are you today, how can I help \u{1F642}?`;
+}
+
+function getPhilippinesHour() {
+  try {
+    const formatter = new Intl.DateTimeFormat("en-US", {
+      hour: "numeric",
+      hour12: false,
+      timeZone: "Asia/Manila"
+    });
+    const hour = Number(formatter.format(new Date()));
+    if (Number.isFinite(hour)) {
+      return hour;
+    }
+  } catch (error) {
+    // Fall through to manual calc.
+  }
+
+  const utcHour = new Date().getUTCHours();
+  return (utcHour + 8) % 24;
+}
+
+function getTimeOfDayGreeting() {
+  const hour = getPhilippinesHour();
+  if (hour < 12) {
+    return "Good Morning";
+  }
+  if (hour < 18) {
+    return "Good Afternoon";
+  }
+  return "Good Evening";
+}
+
+function getTitleForProfile(profile) {
+  const email = String(profile.email || "").toLowerCase();
+  const isSpx = email.endsWith("@spxexpress.com");
+  if (!isSpx) {
+    return "";
+  }
+
+  if (profile.gender === "female") {
+    return "Ma'am";
+  }
+
+  return "Sir";
+}
+
+function getGreetingOverride(profile) {
+  const email = String(profile.email || "").toLowerCase();
+  if (!email) {
+    return null;
+  }
+  const override = greetingOverrides.get(email);
+  if (!override) {
+    return null;
+  }
+
+  const title = override.gender === "female" ? "Ma'am" : "Sir";
+  return `Hello ${title} ${override.name} \u{1F44B}, How can I help you today?`;
+}
+
+async function buildGreeting(event) {
+  const profile = await getSeatalkProfileDetails(event);
+  const override = getGreetingOverride(profile);
+  if (override) {
+    return override;
+  }
+
+  const name = formatFirstName(profile.name);
+  const title = getTitleForProfile(profile);
+  const timeGreeting = getTimeOfDayGreeting();
+  if (title) {
+    return `Hello ${title} ${name} \u{1F44B} ${timeGreeting}!\nHow can I help you today?`;
+  }
+
+  return `Hello ${name} \u{1F44B} ${timeGreeting}!\nHow can I help you today?`;
+}
+
+function getEventMessageText(event) {
+  if (typeof event?.message?.text === "string") {
+    return event.message.text;
+  }
+
+  return (
+    event?.message?.text?.plain_text ||
+    event?.message?.text?.content ||
+    event?.message?.text?.text ||
+    event?.message?.content ||
+    event?.message?.text ||
+    event?.text ||
+    ""
+  );
+}
+
+function isHelpRequest(text) {
+  const normalized = normalizeText(text);
+  if (!normalized) {
+    return false;
+  }
+
+  if (normalized === "help" || normalized === "commands") {
+    return true;
+  }
+
+  return (
+    normalized.includes("help me") ||
+    normalized.includes("what can you do") ||
+    normalized.includes("how can you help") ||
+    normalized.includes("how do i") ||
+    normalized.includes("how to") ||
+    normalized.includes("usage")
+  );
+}
+
+function isGreetingOnly(text) {
+  const normalized = normalizeText(text);
+  if (!normalized) {
+    return true;
+  }
+
+  const greetings = new Set([
+    "hi",
+    "hello",
+    "hey",
+    "yo",
+    "sup",
+    "hi there",
+    "hello there",
+    "hey there",
+    "good morning",
+    "good afternoon",
+    "good evening",
+    "morning",
+    "afternoon",
+    "evening"
+  ]);
+
+  return greetings.has(normalized);
+}
+
+function isConversational(text) {
+  const normalized = normalizeText(text);
+  if (!normalized) {
+    return false;
+  }
+
+  const phrases = [
+    "thank you",
+    "thanks",
+    "appreciate",
+    "how are you",
+    "how r u",
+    "how is it going",
+    "hows it going",
+    "what's up",
+    "whats up",
+    "good morning",
+    "good afternoon",
+    "good evening",
+    "do you want",
+    "can you",
+    "are you",
+    "tell me about yourself"
+  ];
+
+  return phrases.some((phrase) => normalized.includes(phrase));
+}
+
+function isAgeQuestion(text) {
+  const normalized = normalizeText(text);
+  if (!normalized) {
+    return false;
+  }
+
+  return (
+    normalized.includes("how old are you") ||
+    normalized.includes("what is your age") ||
+    normalized.includes("when were you created") ||
+    normalized.includes("when were you made") ||
+    (normalized.includes("age") && normalized.includes("you"))
+  );
 }
 
 const KNOWN_COMMANDS = new Set(["help", "search", "reindex"]);
@@ -393,12 +602,19 @@ function stripBotMention(text) {
 }
 
 const profileCache = new Map();
+const greetingOverrides = new Map([
+  [
+    "romark.fernandez@spxexpress.com",
+    { name: "Mark", gender: "male", omitTimeGreeting: true }
+  ]
+]);
 
 function getProfileCacheKey(event) {
-  return event?.seatalk_id || event?.employee_code || event?.email || null;
+  const identity = getSeatalkIdentity(event);
+  return identity.seatalk_id || identity.employee_code || identity.email || null;
 }
 
-function getCachedProfileName(key) {
+function getCachedProfile(key) {
   if (!key || !profileCache.has(key)) {
     return null;
   }
@@ -409,18 +625,96 @@ function getCachedProfileName(key) {
     return null;
   }
 
-  return entry.name;
+  return entry;
 }
 
-function cacheProfileName(key, name) {
-  if (!key || !name || SEATALK_PROFILE_CACHE_MINUTES <= 0) {
+function cacheProfile(key, profile) {
+  if (!key || !profile || !profile.name || SEATALK_PROFILE_CACHE_MINUTES <= 0) {
     return;
   }
 
   profileCache.set(key, {
-    name,
+    name: profile.name,
+    gender: profile.gender || null,
+    email: profile.email || null,
     expiresAtMs: Date.now() + SEATALK_PROFILE_CACHE_MINUTES * 60 * 1000
   });
+}
+
+function normalizeGender(value) {
+  if (value === null || value === undefined) {
+    return null;
+  }
+
+  if (typeof value === "boolean") {
+    return value ? "male" : "female";
+  }
+
+  const normalized = String(value).toLowerCase().trim();
+  if (["m", "male", "man", "boy", "1"].includes(normalized)) {
+    return "male";
+  }
+  if (["f", "female", "woman", "girl", "2"].includes(normalized)) {
+    return "female";
+  }
+
+  if (normalized.includes("mr") || normalized.includes("sir")) {
+    return "male";
+  }
+  if (
+    normalized.includes("ms") ||
+    normalized.includes("mrs") ||
+    normalized.includes("miss") ||
+    normalized.includes("maam") ||
+    normalized.includes("ma'am")
+  ) {
+    return "female";
+  }
+
+  return null;
+}
+
+function extractGender(profile) {
+  if (!profile) {
+    return null;
+  }
+
+  const candidates = [
+    profile.gender,
+    profile.sex,
+    profile.gender_code,
+    profile.is_male,
+    profile.isMale,
+    profile.is_female,
+    profile.isFemale,
+    profile.title
+  ];
+
+  for (const candidate of candidates) {
+    const normalized = normalizeGender(candidate);
+    if (normalized) {
+      return normalized;
+    }
+  }
+
+  const name = extractDisplayName(profile);
+  if (name) {
+    const lower = name.toLowerCase();
+    if (lower.startsWith("mr ") || lower.startsWith("sir ")) {
+      return "male";
+    }
+    if (
+      lower.startsWith("ms ") ||
+      lower.startsWith("mrs ") ||
+      lower.startsWith("miss ") ||
+      lower.startsWith("ma'am ") ||
+      lower.startsWith("maam ")
+    ) {
+      return "female";
+    }
+  }
+
+  return null;
 }
 
 function extractDisplayName(profile) {
@@ -460,20 +754,21 @@ function extractDisplayName(profile) {
   return null;
 }
 
-async function fetchSeatalkProfileName(event) {
+async function fetchSeatalkProfile(event) {
   if (!SEATALK_PROFILE_URL) {
     return null;
   }
 
+  const identity = getSeatalkIdentity(event);
   const payload = {};
-  if (event?.seatalk_id) {
-    payload.seatalk_id = event.seatalk_id;
+  if (identity.seatalk_id) {
+    payload.seatalk_id = identity.seatalk_id;
   }
-  if (event?.employee_code) {
-    payload.employee_code = event.employee_code;
+  if (identity.employee_code) {
+    payload.employee_code = identity.employee_code;
   }
-  if (event?.email) {
-    payload.email = event.email;
+  if (identity.email) {
+    payload.email = identity.email;
   }
 
   if (!Object.keys(payload).length) {
@@ -487,7 +782,10 @@ async function fetchSeatalkProfileName(event) {
       payload
     );
     const data = response.data?.data ?? response.data;
-    return extractDisplayName(data);
+    return {
+      name: extractDisplayName(data),
+      gender: extractGender(data)
+    };
   } catch (error) {
     console.warn(
       "Failed to fetch Seatalk profile name:",
@@ -497,24 +795,88 @@ async function fetchSeatalkProfileName(event) {
   }
 }
 
+async function fetchSeatalkProfileName(event) {
+  const profile = await fetchSeatalkProfile(event);
+  return profile?.name || null;
+}
+
 async function getSeatalkDisplayName(event) {
   if (event?.name) {
     return event.name;
   }
 
   const cacheKey = getProfileCacheKey(event);
-  const cached = getCachedProfileName(cacheKey);
-  if (cached) {
-    return cached;
+  const cached = getCachedProfile(cacheKey);
+  if (cached?.name) {
+    return cached.name;
   }
 
-  const fetched = await fetchSeatalkProfileName(event);
-  if (fetched) {
-    cacheProfileName(cacheKey, fetched);
-    return fetched;
+  const fetched = await fetchSeatalkProfile(event);
+  if (fetched?.name) {
+    cacheProfile(cacheKey, {
+      name: fetched.name,
+      gender: fetched.gender,
+      email: getSeatalkIdentity(event).email || null
+    });
+    return fetched.name;
   }
 
   return formatUserName(event);
+}
+
+async function getSeatalkProfileDetails(event) {
+  const cacheKey = getProfileCacheKey(event);
+  const cached = getCachedProfile(cacheKey);
+  const identity = getSeatalkIdentity(event);
+  if (cached?.name) {
+    return {
+      name: cached.name,
+      gender: cached.gender,
+      email: cached.email || identity.email || null
+    };
+  }
+
+  const fetched = await fetchSeatalkProfile(event);
+  if (fetched?.name) {
+    const profile = {
+      name: fetched.name,
+      gender: fetched.gender,
+      email: identity.email || null
+    };
+    cacheProfile(cacheKey, profile);
+    return profile;
+  }
+
+  return {
+    name: formatUserName(event),
+    gender: null,
+    email: identity.email || null
+  };
+}
+
+function getPositiveLead() {
+  const options = [
+    "Got it! Here's the update:",
+    "On it - here's the latest:",
+    "Quick update for you:",
+    "Happy to help. Here's what I found:",
+    "Here's the latest snapshot:"
+  ];
+  return options[Math.floor(Math.random() * options.length)];
+}
+
+async function readSheetRange(spreadsheetId, range) {
+  const sheetsApi = await getSheetsApi();
+  if (!sheetsApi) {
+    return null;
+  }
+
+  const response = await sheetsApi.spreadsheets.values.get({
+    spreadsheetId,
+    range
+  });
+
+  return response.data?.values || [];
 }
 
 function scoreTabMatch(userMessage, tabName) {
@@ -1041,13 +1403,14 @@ function buildTabSuggestionReply(suggestions) {
 
 async function generateIntelligentReply(userMessage, options = {}) {
   if (!OPENROUTER_API_KEY || !OPENROUTER_MODEL) {
-    return "Thanks for your message! (AI not configured yet.)";
+    return "Thanks for your message.";
   }
 
-  const systemPrompt =
-    `You are ${BOT_NAME}, a helpful SeaTalk bot. Respond intelligently, short, and concise (1-3 sentences). Do not include greetings. ` +
-    "If the request is about backlogs, top contributors by region, or truck requests, answer using the provided sheet context. " +
-    "If it is unclear or does not match, ask one brief clarifying question and give one example query.";
+  const systemPrompt = options.conversation
+    ? `You are ${BOT_NAME}, a friendly SeaTalk bot. Respond naturally and concisely (1-3 sentences).`
+    : `You are ${BOT_NAME}, a helpful SeaTalk bot. Respond intelligently, short, and concise (1-3 sentences). Do not include greetings. ` +
+      "If the request is about backlogs, top contributors by region, or truck requests, answer using the provided sheet context. " +
+      "If it is unclear or does not match, ask one brief clarifying question and give one example query.";
   const sheetContext = options.skipSheetContext
     ? ""
     : buildSheetContext(userMessage, {
@@ -1108,7 +1471,7 @@ async function generateIntelligentReply(userMessage, options = {}) {
       "OpenRouter reply failed:",
       error.response?.data || error.message
     );
-    return "Thanks for your message. I'm having trouble responding right now.";
+    return "Thanks for your message.";
   }
 }
 
@@ -1116,16 +1479,18 @@ async function handleSubscriberMessage(event, ctx = {}) {
   const requestId = ctx.requestId || "unknown";
   const log = ctx.logger || logger;
   const startedAt = Date.now();
-  const track = typeof ctx.trackEvent === "function" ? ctx.trackEvent : null;
+    const track = typeof ctx.trackEvent === "function" ? ctx.trackEvent : null;
 
   try {
     const employee_code = event.employee_code;
-    const rawText = event.message?.text?.content?.trim();
+    const rawText = getEventMessageText(event).trim();
     const msgText = stripBotMention(rawText);
-    const greeting = buildGreeting(event);
-
-    const replyWithGreeting = async (text) => {
-      const content = text ? `${greeting}\n${text}` : greeting;
+    const replyWithText = async (text, options = {}) => {
+      if (!text) {
+        return;
+      }
+      const lead = options.addLead ? getPositiveLead() : "";
+      const content = lead ? `${lead}\n\n${text}` : text;
       await replyToSubscriber(employee_code, content);
     };
 
@@ -1138,7 +1503,13 @@ async function handleSubscriberMessage(event, ctx = {}) {
     }
 
     if (!msgText) {
-      await replyWithGreeting("I can only read text messages right now.");
+      await replyWithText("I can only read text messages right now.");
+      return;
+    }
+
+    if (isGreetingOnly(msgText)) {
+      const greeting = await buildGreeting(event);
+      await replyToSubscriber(employee_code, greeting);
       return;
     }
 
@@ -1146,6 +1517,7 @@ async function handleSubscriberMessage(event, ctx = {}) {
       typeof commands.parseCommand === "function"
         ? commands.parseCommand(msgText)
         : null;
+    const isHelp = !parsedCommand && isHelpRequest(msgText);
     if (parsedCommand) {
       log.info("command_received", {
         requestId,
@@ -1159,6 +1531,44 @@ async function handleSubscriberMessage(event, ctx = {}) {
           track(BotEventType.INVALID_COMMAND, { command: parsedCommand.cmd });
         }
       }
+    } else if (isHelp && track) {
+      track(BotEventType.HELP_REQUEST, { source: "keyword" });
+    }
+
+    if (isHelp) {
+      const helpReply = await commands.handle("/help", {
+        store: indexStore,
+        logger: log,
+        requestId
+      });
+      if (helpReply && helpReply.text) {
+        await replyWithText(helpReply.text);
+        return;
+      }
+    }
+
+    if (isGreetingOnly(msgText)) {
+      const greeting = await buildGreeting(event);
+      await replyToSubscriber(employee_code, greeting);
+      return;
+    }
+
+    if (isAgeQuestion(msgText)) {
+      await replyWithText(
+        "I don't have a real age. I'm a bot here to help you with questions."
+      );
+      return;
+    }
+
+    if (isConversational(msgText)) {
+      const convoReply = await generateIntelligentReply(msgText, {
+        skipSheetContext: true,
+        conversation: true,
+        logger: log,
+        requestId
+      });
+      await replyWithText(convoReply || "I'm here if you need anything.");
+      return;
     }
 
     const commandReply = await commands.handle(msgText, {
@@ -1167,7 +1577,7 @@ async function handleSubscriberMessage(event, ctx = {}) {
       requestId
     });
     if (commandReply && commandReply.text) {
-      await replyWithGreeting(commandReply.text);
+      await replyWithText(commandReply.text);
       return;
     }
 
@@ -1178,16 +1588,17 @@ async function handleSubscriberMessage(event, ctx = {}) {
 
     const intentReply = await intentService.handleIntentMessage(msgText, {
       sheetCache,
-      refreshSheetCache
+      refreshSheetCache,
+      readSheetRange
     });
     if (intentReply && intentReply.text) {
-      await replyWithGreeting(intentReply.text);
+      await replyWithText(intentReply.text, { addLead: true });
       return;
     }
 
     const loadedIndex = Array.isArray(indexStore.items) ? indexStore.items : [];
     if (!loadedIndex.length) {
-      await replyWithGreeting("Index is empty. Run /reindex to build it.");
+      await replyWithText("Index is empty. Run /reindex to build it.");
       return;
     }
 
@@ -1199,7 +1610,7 @@ async function handleSubscriberMessage(event, ctx = {}) {
       requestId
     });
     if (searchReply && searchReply.text) {
-      await replyWithGreeting(searchReply.text);
+      await replyWithText(searchReply.text, { addLead: true });
       return;
     }
 
@@ -1212,7 +1623,7 @@ async function handleSubscriberMessage(event, ctx = {}) {
       logger: log,
       requestId
     });
-    await replyWithGreeting(fallbackReply || "Thanks for your message.");
+    await replyWithText(fallbackReply || "Thanks for your message.");
   } catch (error) {
     log.error("subscriber_message_error", {
       requestId,
@@ -1394,6 +1805,36 @@ app.get("/ready", (req, res) => {
   });
 });
 
+app.post("/v1/bot/events", (req, res) => {
+  const requestId = req.headers["x-request-id"] || createRequestId();
+  const payload = req.body || {};
+  const required = ["event_id", "event_type", "mode", "occurred_at"];
+  const missing = required.filter((key) => !payload[key]);
+  if (missing.length) {
+    return res
+      .status(400)
+      .json({ status: "error", message: `Missing ${missing.join(", ")}` });
+  }
+
+  const resolvedType = resolveBotEventType(payload.event_type);
+  trackEvent({
+    type: resolvedType,
+    requestId,
+    seatalkEventType: payload.event_type,
+    event: payload,
+    logger,
+    details: {
+      event_id: payload.event_id,
+      mode: payload.mode,
+      occurred_at: payload.occurred_at,
+      tenant_id: payload.tenant_id || null,
+      metadata: payload.metadata || null
+    }
+  });
+
+  return res.json({ status: "ok", event_id: payload.event_id });
+});
+
 app.post("/seatalk/notify", async (req, res) => {
   const requestId = req.headers["x-request-id"] || createRequestId();
   const bodyRaw = req.rawBody || Buffer.from(JSON.stringify(req.body || {}));
@@ -1532,10 +1973,20 @@ app.post("/seatalk/callback", (req, res) => {
             stripBotMention,
             handleIntentMessage: intentService.handleIntentMessage,
             parseCommand: commands.parseCommand,
+            handleCommand: commands.handle,
+            commandContext: {
+              store: indexStore,
+              logger,
+              requestId
+            },
             knownCommands: KNOWN_COMMANDS,
             detectIntent: intentService.detectIntent,
             trackEvent: track,
             buildGreeting,
+            generateReply: generateIntelligentReply,
+            requestId,
+            logger,
+            readSheetRange,
             postWithAuth,
             apiBaseUrl: SEATALK_API_BASE_URL
           })
@@ -1578,3 +2029,4 @@ const PORT = env.PORT;
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
 });
+

@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: seatalk-bot
+    env: node
+    plan: starter
+    buildCommand: npm ci --omit=dev
+    startCommand: npm start
+    healthCheckPath: /ready
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: INDEX_STORE_PATH
+        value: /var/data/chunks.jsonl
+disks:
+  - name: seatalk-data
+    mountPath: /var/data
+    sizeGB: 1

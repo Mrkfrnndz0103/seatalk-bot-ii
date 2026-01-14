@@ -2,6 +2,7 @@ const fs = require("fs");
 const path = require("path");
 const { google } = require("googleapis");
 const env = require("../config/env");
+const { logger } = require("../utils/logger");
 
 const DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.metadata.readonly"];
 const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
@@ -29,7 +30,7 @@ function loadOAuthToken(tokenPath) {
   try {
     return JSON.parse(fs.readFileSync(tokenPath, "utf8"));
   } catch (error) {
-    console.warn("Failed to parse Google OAuth token file:", error.message);
+    logger.warn("google_oauth_token_parse_failed", { error: error.message });
     return null;
   }
 }

@@ -1,6 +1,7 @@
 const fs = require("fs");
 const path = require("path");
 const { tokenize } = require("../utils/text");
+const { logger } = require("../utils/logger");
 
 class FileStore {
   constructor(options = {}) {
@@ -43,7 +44,7 @@ class FileStore {
       try {
         parsed.push(JSON.parse(line));
       } catch (error) {
-        console.warn("Skipping invalid JSONL line:", error.message);
+        logger.warn("filestore_invalid_jsonl", { error: error.message });
       }
     }
 

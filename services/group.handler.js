@@ -295,7 +295,9 @@ function getPositiveLead() {
 async function handleGroupMention(event, deps) {
   const groupId = getGroupId(event);
   if (!groupId) {
-    console.warn("Group mention missing group id.");
+    if (deps.logger && deps.logger.warn) {
+      deps.logger.warn("group_mention_missing_group_id");
+    }
     return;
   }
 

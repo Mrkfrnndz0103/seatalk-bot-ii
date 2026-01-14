@@ -4,6 +4,7 @@ const env = require("../config/env");
 const { listSpreadsheetsInFolder } = require("../clients/drive.client");
 const { getTabsAndGrid, readValues } = require("../clients/sheets.client");
 const { buildRange, colToLetter } = require("../utils/a1");
+const { logger } = require("../utils/logger");
 const { toChunks } = require("./chunker");
 
 const TAB_READ_DELAY_MS = 400;
@@ -156,9 +157,7 @@ async function indexDriveFolder(store) {
       tabs = await getTabsAndGrid(spreadsheetId);
     } catch (error) {
       if (isPermissionError(error)) {
-        console.warn(
-          `Skipping spreadsheet ${spreadsheetId} due to permission error.`
-        );
+        logger.warn("indexer_permission_skip_spreadsheet", { spreadsheetId });
         continue;
       }
       throw error;
@@ -189,9 +188,10 @@ async function indexDriveFolder(store) {
         values = await readValues(spreadsheetId, scanRangeA1);
       } catch (error) {
         if (isPermissionError(error)) {
-          console.warn(
-            `Skipping tab ${tab.title} in ${spreadsheetId} due to permission error.`
-          );
+          logger.warn("indexer_permission_skip_tab", {
+            spreadsheetId,
+            tabName: tab.title
+          });
           if (TAB_READ_DELAY_MS > 0) {
             await sleep(TAB_READ_DELAY_MS);
           }

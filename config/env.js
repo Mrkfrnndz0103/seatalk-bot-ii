@@ -128,6 +128,7 @@ const env = {
     DEFAULT_HTTP_TIMEOUT_MS
   ),
   BOT_NAME: process.env.BOT_NAME || "SeaTalk Bot",
+  GREETING_OVERRIDES_JSON: process.env.GREETING_OVERRIDES_JSON || "",
   DRIVE_FOLDER_ID: process.env.DRIVE_FOLDER_ID || "",
   SYNC_DRIVE_FOLDER_ID:
     process.env.SYNC_DRIVE_FOLDER_ID || process.env.DRIVE_FOLDER_ID || "",

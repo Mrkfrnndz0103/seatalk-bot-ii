@@ -7,11 +7,6 @@ const path = require("path");
 const { google } = require("googleapis");
 
 require("dotenv").config();
-console.log("ENV CHECK", {
-  hasKey: Boolean(process.env.OPENROUTER_API_KEY),
-  model: process.env.OPENROUTER_MODEL
-});
-
 const env = require("./config/env");
 const { FileStore } = require("./store/file.store");
 const commands = require("./commands");
@@ -19,6 +14,7 @@ const intentService = require("./services/intent.service");
 const groupHandler = require("./services/group.handler");
 const interactiveHandler = require("./services/interactive.handler");
 const scheduler = require("./services/scheduler");
+const { createDriveZipSync } = require("./services/drive.sync");
 const { logger } = require("./utils/logger");
 const { isValidSignature, getSignatureHeader } = require("./utils/signature");
 const { BotEventType } = require("./events/event.types");
@@ -31,6 +27,18 @@ const { shouldUseEmployeeLookup } = require("./services/llm.tool.policy");
 
 const app = express();
 const rateLimitState = new Map();
+const rateLimitCleanupIntervalMs = Math.max(
+  env.RATE_LIMIT_WINDOW_MS || 0,
+  60 * 1000
+);
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, entry] of rateLimitState.entries()) {
+    if (!entry || now > entry.resetAt) {
+      rateLimitState.delete(ip);
+    }
+  }
+}, rateLimitCleanupIntervalMs).unref();
 
 function rawBodySaver(req, res, buf) {
   if (buf && buf.length) {
@@ -96,12 +104,61 @@ function resolveBotEventType(value) {
   return BotEventType.ERROR;
 }
 
+function getMissingRequiredConfig() {
+  const missing = [];
+  if (!env.SIGNING_SECRET) {
+    missing.push("SIGNING_SECRET");
+  }
+  const hasSeatalkCreds = Boolean(
+    env.BOT_ACCESS_TOKEN ||
+      (env.SEATALK_TOKEN_URL && env.SEATALK_APP_ID && env.SEATALK_APP_SECRET)
+  );
+  if (!hasSeatalkCreds) {
+    missing.push("SEATALK_CREDENTIALS");
+  }
+  return missing;
+}
+
+function validateStartupConfig() {
+  const missing = getMissingRequiredConfig();
+  if (missing.length) {
+    logger.error("startup_config_invalid", { missing });
+    process.exit(1);
+  }
+}
+
+function requestLogger(req, res, next) {
+  const requestId =
+    req.headers["x-request-id"] || req.requestId || createRequestId();
+  req.requestId = requestId;
+  res.setHeader("x-request-id", requestId);
+
+  const startedAt = Date.now();
+  res.on("finish", () => {
+    logger.info(
+      {
+        requestId,
+        method: req.method,
+        path: req.originalUrl || req.url,
+        statusCode: res.statusCode,
+        latencyMs: Date.now() - startedAt,
+        clientIp: getClientIp(req),
+        userAgent: req.headers["user-agent"] || ""
+      },
+      "request_complete"
+    );
+  });
+
+  next();
+}
+
 app.use(
   express.json({
     verify: rawBodySaver,
     limit: env.REQUEST_BODY_LIMIT
   })
 );
+app.use(requestLogger);
 app.use(rateLimit);
 
 const indexStore = new FileStore({ path: env.INDEX_STORE_PATH });
@@ -168,7 +225,15 @@ const BACKLOGS_IMAGE_SHEET_ID = env.BACKLOGS_IMAGE_SHEET_ID;
 const BACKLOGS_IMAGE_TAB_NAME = env.BACKLOGS_IMAGE_TAB_NAME;
 const BACKLOGS_IMAGE_GID = env.BACKLOGS_IMAGE_GID;
 const BACKLOGS_IMAGE_RANGE = env.BACKLOGS_IMAGE_RANGE;
+const BACKLOGS_MONITOR_RANGE = env.BACKLOGS_MONITOR_RANGE;
+const BACKLOGS_MONITOR_STATE_PATH = env.BACKLOGS_MONITOR_STATE_PATH;
 const BACKLOGS_TIMEZONE = env.BACKLOGS_TIMEZONE;
+const SYNC_DRIVE_FOLDER_ID = env.SYNC_DRIVE_FOLDER_ID;
+const SYNC_SHEET_ID = env.SYNC_SHEET_ID;
+const SYNC_SHEET_TAB_NAME = env.SYNC_SHEET_TAB_NAME;
+const SYNC_START_CELL = env.SYNC_START_CELL;
+const SYNC_STATE_PATH = env.SYNC_STATE_PATH;
+const SYNC_MIN_CSV_WARN = env.SYNC_MIN_CSV_WARN;
 
 const seatalkMcpClient = new SeatalkMcpClient({
   endpoint: MCP_ENDPOINT,
@@ -197,6 +262,18 @@ const llmAgent = createLlmAgent({
   toolDefinitions: seatalkMcpTools.definitions,
   toolHandlers: seatalkMcpTools.tools,
   logger
+});
+
+const runDriveZipSync = createDriveZipSync({
+  getDriveApi,
+  getSheetsApi,
+  logger,
+  folderId: SYNC_DRIVE_FOLDER_ID,
+  sheetId: SYNC_SHEET_ID,
+  tabName: SYNC_SHEET_TAB_NAME,
+  startCell: SYNC_START_CELL,
+  statePath: SYNC_STATE_PATH,
+  minCsvWarn: SYNC_MIN_CSV_WARN
 });
 
 // ======================
@@ -711,12 +788,36 @@ function disableProfileLookupTemporarily(reason) {
     });
   }
 }
-const greetingOverrides = new Map([
-  [
-    "romark.fernandez@spxexpress.com",
-    { name: "Mark", gender: "male", omitTimeGreeting: true }
-  ]
-]);
+function loadGreetingOverrides(raw) {
+  const overrides = new Map();
+  if (!raw) {
+    return overrides;
+  }
+
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") {
+      return overrides;
+    }
+    Object.entries(parsed).forEach(([email, value]) => {
+      const normalizedEmail = String(email || "").toLowerCase().trim();
+      if (!normalizedEmail || !value || typeof value !== "object") {
+        return;
+      }
+      overrides.set(normalizedEmail, {
+        name: value.name || "",
+        gender: value.gender || null,
+        omitTimeGreeting: Boolean(value.omitTimeGreeting)
+      });
+    });
+  } catch (error) {
+    logger.warn("greeting_overrides_invalid", { error: error.message });
+  }
+
+  return overrides;
+}
+
+const greetingOverrides = loadGreetingOverrides(env.GREETING_OVERRIDES_JSON);
 
 function getProfileCacheKey(event) {
   const identity = getSeatalkIdentity(event);
@@ -957,7 +1058,7 @@ async function fetchSeatalkProfile(event) {
       if (getSeatalkErrorCode(error) === 103) {
         disableProfileLookupTemporarily("permission_denied");
       }
-      console.warn("MCP profile lookup failed:", error.message);
+      logger.warn("mcp_profile_lookup_failed", { error: error.message });
     }
   }
 
@@ -997,10 +1098,9 @@ async function fetchSeatalkProfile(event) {
     if (getSeatalkErrorCode(error) === 103) {
       disableProfileLookupTemporarily("permission_denied");
     }
-    console.warn(
-      "Failed to fetch Seatalk profile name:",
-      error.response?.data || error.message
-    );
+    logger.warn("seatalk_profile_lookup_failed", {
+      error: error.response?.data || error.message
+    });
     return null;
   }
 }
@@ -1133,6 +1233,8 @@ function shouldSuggestTabs(userMessage) {
 
 let sheetsApiClient = null;
 let sheetsApiInitPromise = null;
+let driveApiClient = null;
+let driveApiInitPromise = null;
 let oauthClient = null;
 let oauthInitPromise = null;
 let serviceAccountClient = null;
@@ -1154,7 +1256,7 @@ function loadOAuthToken() {
   try {
     return JSON.parse(fs.readFileSync(GOOGLE_OAUTH_TOKEN_FILE, "utf8"));
   } catch (error) {
-    console.warn("Failed to parse Google OAuth token file:", error.message);
+    logger.warn("google_oauth_token_parse_failed", { error: error.message });
     return null;
   }
 }
@@ -1192,9 +1294,9 @@ async function initServiceAccountClient() {
   }
 
   if (!fs.existsSync(GOOGLE_SERVICE_ACCOUNT_FILE)) {
-    console.warn(
-      `Google service account file not found: ${GOOGLE_SERVICE_ACCOUNT_FILE}`
-    );
+    logger.warn("google_service_account_missing", {
+      path: GOOGLE_SERVICE_ACCOUNT_FILE
+    });
     return null;
   }
 
@@ -1204,10 +1306,9 @@ async function initServiceAccountClient() {
       fs.readFileSync(GOOGLE_SERVICE_ACCOUNT_FILE, "utf8")
     );
   } catch (error) {
-    console.warn(
-      "Failed to parse Google service account file:",
-      error.message
-    );
+    logger.warn("google_service_account_parse_failed", {
+      error: error.message
+    });
     return null;
   }
 
@@ -1247,6 +1348,37 @@ async function getSheetsApi() {
   }
 
   return sheetsApiInitPromise;
+}
+
+async function getDriveApi() {
+  if (driveApiClient) {
+    return driveApiClient;
+  }
+
+  if (!driveApiInitPromise) {
+    driveApiInitPromise = (async () => {
+      const oauthClient = await initOAuthClient();
+      if (oauthClient) {
+        driveApiClient = google.drive({ version: "v3", auth: oauthClient });
+        return driveApiClient;
+      }
+
+      const serviceAccountClient = await initServiceAccountClient();
+      if (serviceAccountClient) {
+        driveApiClient = google.drive({
+          version: "v3",
+          auth: serviceAccountClient
+        });
+        return driveApiClient;
+      }
+
+      return null;
+    })().finally(() => {
+      driveApiInitPromise = null;
+    });
+  }
+
+  return driveApiInitPromise;
 }
 
 async function getGoogleOAuthClient() {
@@ -1424,6 +1556,98 @@ async function fetchSheetPngBase64(spreadsheetId, tabName, range) {
   return null;
 }
 
+function escapeSheetTabName(tabName) {
+  const trimmed = String(tabName || "").trim();
+  if (!trimmed) {
+    return "";
+  }
+  if (trimmed.includes("'")) {
+    return `'${trimmed.replace(/'/g, "''")}'`;
+  }
+  if (/\s/.test(trimmed)) {
+    return `'${trimmed}'`;
+  }
+  return trimmed;
+}
+
+function buildBacklogsMonitorRange(tabName, range) {
+  const trimmedRange = String(range || "").trim();
+  if (!trimmedRange) {
+    return "";
+  }
+  if (trimmedRange.includes("!")) {
+    return trimmedRange;
+  }
+  const safeTab = escapeSheetTabName(tabName);
+  return safeTab ? `${safeTab}!${trimmedRange}` : trimmedRange;
+}
+
+function computeRangeSignature(values) {
+  const payload = JSON.stringify(values || []);
+  return crypto.createHash("sha256").update(payload).digest("hex");
+}
+
+function loadBacklogsMonitorState() {
+  if (!BACKLOGS_MONITOR_STATE_PATH) {
+    return {};
+  }
+  if (!fs.existsSync(BACKLOGS_MONITOR_STATE_PATH)) {
+    return {};
+  }
+  try {
+    const raw = fs.readFileSync(BACKLOGS_MONITOR_STATE_PATH, "utf8");
+    return raw ? JSON.parse(raw) : {};
+  } catch (error) {
+    logger.warn("backlogs_monitor_state_read_failed", {
+      error: error.message
+    });
+    return {};
+  }
+}
+
+function updateBacklogsMonitorState(nextState) {
+  if (!nextState || typeof nextState !== "object") {
+    return;
+  }
+  backlogsMonitorState = {
+    ...(backlogsMonitorState || {}),
+    ...nextState
+  };
+
+  if (!BACKLOGS_MONITOR_STATE_PATH) {
+    return;
+  }
+  const dir = path.dirname(BACKLOGS_MONITOR_STATE_PATH);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+  fs.writeFileSync(
+    BACKLOGS_MONITOR_STATE_PATH,
+    JSON.stringify(backlogsMonitorState, null, 2)
+  );
+}
+
+async function fetchBacklogsMonitorSignature() {
+  if (!BACKLOGS_IMAGE_SHEET_ID) {
+    return null;
+  }
+  const monitorRange = buildBacklogsMonitorRange(
+    BACKLOGS_IMAGE_TAB_NAME,
+    BACKLOGS_MONITOR_RANGE || BACKLOGS_IMAGE_RANGE
+  );
+  if (!monitorRange) {
+    logger.warn("backlogs_monitor_missing_range");
+    return null;
+  }
+  const values = await readSheetRange(BACKLOGS_IMAGE_SHEET_ID, monitorRange);
+  if (values === null) {
+    return null;
+  }
+  return computeRangeSignature(values);
+}
+
+let backlogsMonitorState = loadBacklogsMonitorState();
+
 function formatBacklogsTimestamp(date = new Date()) {
   const timeZone = BACKLOGS_TIMEZONE || "UTC";
   try {
@@ -1474,48 +1698,78 @@ async function sendBacklogsScheduledUpdate() {
     return;
   }
 
-    backlogsUpdateInFlight = true;
-    try {
-      const messageText = buildBacklogsScheduledText(new Date());
-      if (!messageText) {
-        logger.warn("backlogs_schedule_missing_text");
-        return;
-      }
+  backlogsUpdateInFlight = true;
+  try {
+    const nowIso = new Date().toISOString();
+    const signature = await fetchBacklogsMonitorSignature();
+    if (!signature) {
+      updateBacklogsMonitorState({ lastCheckedAt: nowIso });
+      logger.warn("backlogs_monitor_signature_failed");
+      return;
+    }
 
-      const imageBase64 = await fetchSheetPngBase64(
-        BACKLOGS_IMAGE_SHEET_ID,
-        BACKLOGS_IMAGE_TAB_NAME,
-        BACKLOGS_IMAGE_RANGE
-      );
-      if (!imageBase64) {
-        logger.warn("backlogs_schedule_missing_image");
-        return;
-      }
-
-      const imageSent = await sendGroupMessage(BACKLOGS_SCHEDULED_GROUP_ID, {
-        tag: "image",
-        image: {
-          content: imageBase64
-        }
+    if (!backlogsMonitorState?.lastSignature) {
+      updateBacklogsMonitorState({
+        lastSignature: signature,
+        lastCheckedAt: nowIso,
+        baselineAt: nowIso
       });
-      if (!imageSent) {
-        logger.warn("backlogs_schedule_image_send_failed");
-        return;
-      }
+      logger.info("backlogs_monitor_baseline_set");
+      return;
+    }
 
-      const textSent = await sendGroupMessage(
-        BACKLOGS_SCHEDULED_GROUP_ID,
-        messageText
-      );
-      if (!textSent) {
-        logger.warn("backlogs_schedule_text_send_failed");
-        return;
+    if (backlogsMonitorState.lastSignature === signature) {
+      updateBacklogsMonitorState({ lastCheckedAt: nowIso });
+      logger.info("backlogs_monitor_no_change");
+      return;
+    }
+
+    const messageText = buildBacklogsScheduledText(new Date());
+    if (!messageText) {
+      logger.warn("backlogs_schedule_missing_text");
+      return;
+    }
+
+    const imageBase64 = await fetchSheetPngBase64(
+      BACKLOGS_IMAGE_SHEET_ID,
+      BACKLOGS_IMAGE_TAB_NAME,
+      BACKLOGS_IMAGE_RANGE
+    );
+    if (!imageBase64) {
+      logger.warn("backlogs_schedule_missing_image");
+      return;
+    }
+
+    const imageSent = await sendGroupMessage(BACKLOGS_SCHEDULED_GROUP_ID, {
+      tag: "image",
+      image: {
+        content: imageBase64
       }
-      trackSystemEvent(BotEventType.BACKLOGS_SCHEDULED, {
-        groupId: BACKLOGS_SCHEDULED_GROUP_ID
-      });
-      logger.info("backlogs_schedule_sent", {
-        groupId: BACKLOGS_SCHEDULED_GROUP_ID,
+    });
+    if (!imageSent) {
+      logger.warn("backlogs_schedule_image_send_failed");
+      return;
+    }
+
+    const textSent = await sendGroupMessage(
+      BACKLOGS_SCHEDULED_GROUP_ID,
+      messageText
+    );
+    if (!textSent) {
+      logger.warn("backlogs_schedule_text_send_failed");
+      return;
+    }
+    updateBacklogsMonitorState({
+      lastSignature: signature,
+      lastCheckedAt: nowIso,
+      lastSentAt: nowIso,
+      lastChangeAt: nowIso
+    });
+    trackSystemEvent(BotEventType.BACKLOGS_SCHEDULED, {
+      groupId: BACKLOGS_SCHEDULED_GROUP_ID
+    });
+    logger.info("backlogs_schedule_sent", {
+      groupId: BACKLOGS_SCHEDULED_GROUP_ID,
       hasImage: Boolean(imageBase64)
     });
   } catch (error) {
@@ -1733,9 +1987,7 @@ async function refreshSheetCache() {
 
     const sheetsApi = await getSheetsApi();
     if (!sheetsApi && (hasOAuthConfig() || GOOGLE_SERVICE_ACCOUNT_FILE)) {
-      console.warn(
-        "Google Sheets API client not available. Check OAuth or service account config."
-      );
+      logger.warn("sheets_api_unavailable");
     }
 
     const sheets = [];
@@ -1747,10 +1999,10 @@ async function refreshSheetCache() {
         const entries = Array.isArray(sheetData) ? sheetData : [sheetData];
         sheets.push(...entries);
       } catch (error) {
-        console.warn(
-          `Failed to load sheet ${link.url}:`,
-          error.response?.data || error.message
-        );
+        logger.warn("sheet_load_failed", {
+          url: link.url,
+          error: error.response?.data || error.message
+        });
       }
     }
 
@@ -1832,14 +2084,14 @@ function buildSheetContext(userMessage, options = {}) {
 
 function startSheetRefreshTimer() {
   refreshSheetCache().catch((error) => {
-    console.warn("Initial sheet load failed:", error.message);
+    logger.warn("sheet_initial_load_failed", { error: error.message });
   });
 
   if (SHEETS_REFRESH_MINUTES > 0) {
     const intervalMs = SHEETS_REFRESH_MINUTES * 60 * 1000;
     setInterval(() => {
       refreshSheetCache().catch((error) => {
-        console.warn("Sheet refresh failed:", error.message);
+        logger.warn("sheet_refresh_failed", { error: error.message });
       });
     }, intervalMs).unref();
   }
@@ -2125,20 +2377,18 @@ async function replyToSubscriber(employee_code, content) {
         messagePayload
       );
       if (response?.code === 0) {
-        console.log("Message sent successfully:", response.message_id);
+        logger.info("subscriber_message_sent", {
+          messageId: response.message_id
+        });
         return;
       }
       if (response?.code) {
-        console.error(
-          "MCP send message failed:",
-          response
-        );
+        logger.error("subscriber_message_failed", { response });
       }
     } catch (error) {
-      console.error(
-        "MCP send message error:",
-        error.message || error
-      );
+      logger.error("subscriber_message_error", {
+        error: error.message || error
+      });
     }
   }
 
@@ -2153,12 +2403,16 @@ async function replyToSubscriber(employee_code, content) {
     );
 
     if (response.data.code === 0) {
-      console.log("Message sent successfully:", response.data.message_id);
+      logger.info("subscriber_message_sent", {
+        messageId: response.data.message_id
+      });
     } else {
-      console.error("Failed to send message:", response.data);
+      logger.error("subscriber_message_failed", { response: response.data });
     }
   } catch (err) {
-    console.error("Error sending message:", err.response?.data || err.message);
+    logger.error("subscriber_message_error", {
+      error: err.response?.data || err.message
+    });
   }
 }
 
@@ -2220,20 +2474,16 @@ async function sendGroupMessage(group_id, content) {
         messagePayload
       );
       if (response?.code === 0) {
-        console.log("Group message sent successfully:", response.message_id);
+        logger.info("group_message_sent", { messageId: response.message_id });
         return true;
       }
       if (response?.code) {
-        console.error(
-          "MCP send group message failed:",
-          response
-        );
+        logger.error("group_message_failed", { response });
       }
     } catch (error) {
-      console.error(
-        "MCP send group message error:",
-        error.message || error
-      );
+      logger.error("group_message_error", {
+        error: error.message || error
+      });
     }
   }
 
@@ -2248,15 +2498,16 @@ async function sendGroupMessage(group_id, content) {
     );
 
     if (response.data.code === 0) {
-      console.log("Group message sent successfully:", response.data.message_id);
+      logger.info("group_message_sent", {
+        messageId: response.data.message_id
+      });
       return true;
     }
-    console.error("Failed to send group message:", response.data);
+    logger.error("group_message_failed", { response: response.data });
   } catch (err) {
-    console.error(
-      "Error sending group message:",
-      err.response?.data || err.message
-    );
+    logger.error("group_message_error", {
+      error: err.response?.data || err.message
+    });
   }
   return false;
 }
@@ -2327,17 +2578,18 @@ app.get("/google/oauth/callback", async (req, res) => {
     sheetsApiClient = google.sheets({ version: "v4", auth: oauthClient });
 
     refreshSheetCache().catch((refreshError) => {
-      console.warn("Sheet refresh failed after OAuth:", refreshError.message);
+      logger.warn("sheet_refresh_after_oauth_failed", {
+        error: refreshError.message
+      });
     });
 
     return res.send(
       "Google OAuth connected. You can close this tab and use the bot."
     );
   } catch (oauthError) {
-    console.error(
-      "Google OAuth callback failed:",
-      oauthError.response?.data || oauthError.message
-    );
+    logger.error("google_oauth_callback_failed", {
+      error: oauthError.response?.data || oauthError.message
+    });
     return res.status(500).send("OAuth failed. Check server logs.");
   }
 });
@@ -2350,17 +2602,7 @@ app.get("/health", (req, res) => {
 });
 
 app.get("/ready", (req, res) => {
-  const missing = [];
-  if (!env.SIGNING_SECRET) {
-    missing.push("SIGNING_SECRET");
-  }
-  const hasSeatalkCreds = Boolean(
-    env.BOT_ACCESS_TOKEN ||
-      (env.SEATALK_TOKEN_URL && env.SEATALK_APP_ID && env.SEATALK_APP_SECRET)
-  );
-  if (!hasSeatalkCreds) {
-    missing.push("SEATALK_CREDENTIALS");
-  }
+  const missing = getMissingRequiredConfig();
 
   const indexLoaded =
     Array.isArray(indexStore.items) && indexStore.items.length > 0;
@@ -2377,7 +2619,8 @@ app.get("/ready", (req, res) => {
 });
 
 app.post("/v1/bot/events", (req, res) => {
-  const requestId = req.headers["x-request-id"] || createRequestId();
+  const requestId =
+    req.requestId || req.headers["x-request-id"] || createRequestId();
   const payload = req.body || {};
   const required = ["event_id", "event_type", "mode", "occurred_at"];
   const missing = required.filter((key) => !payload[key]);
@@ -2407,7 +2650,8 @@ app.post("/v1/bot/events", (req, res) => {
 });
 
 app.post("/seatalk/notify", async (req, res) => {
-  const requestId = req.headers["x-request-id"] || createRequestId();
+  const requestId =
+    req.requestId || req.headers["x-request-id"] || createRequestId();
   const bodyRaw = req.rawBody || Buffer.from(JSON.stringify(req.body || {}));
   const signature = getSignatureHeader(req.headers);
 
@@ -2450,7 +2694,8 @@ app.post("/seatalk/notify", async (req, res) => {
 // Callback endpoint
 // ======================
 app.post("/seatalk/callback", (req, res) => {
-  const requestId = req.headers["x-request-id"] || createRequestId();
+  const requestId =
+    req.requestId || req.headers["x-request-id"] || createRequestId();
   const startedAt = Date.now();
   const bodyRaw = req.rawBody || Buffer.from(JSON.stringify(req.body || {}));
   const signature = getSignatureHeader(req.headers);
@@ -2595,13 +2840,46 @@ app.post("/seatalk/callback", (req, res) => {
 // ======================
 // Start server
 // ======================
-startSheetRefreshTimer();
-scheduler.startScheduler(trackSystemEvent, sendBacklogsScheduledUpdate);
+async function runScheduledTasks() {
+  await runDriveZipSync();
+  await sendBacklogsScheduledUpdate();
+}
 
-const PORT = env.PORT;
-app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
+validateStartupConfig();
+startSheetRefreshTimer();
+scheduler.startScheduler(trackSystemEvent, runScheduledTasks, {
+  logger
 });
 
+const PORT = env.PORT;
+const server = app.listen(PORT, () => {
+  logger.info("server_started", { port: PORT });
+});
+
+process.on("unhandledRejection", (reason) => {
+  logger.error("unhandled_rejection", {
+    error: reason?.stack || reason
+  });
+  process.exit(1);
+});
+
+process.on("uncaughtException", (error) => {
+  logger.error("uncaught_exception", {
+    error: error?.stack || error
+  });
+  process.exit(1);
+});
+
+process.on("SIGTERM", () => {
+  logger.info("sigterm_received");
+  server.close(() => {
+    logger.info("server_closed");
+    process.exit(0);
+  });
+  setTimeout(() => {
+    logger.error("sigterm_force_exit");
+    process.exit(1);
+  }, 10000).unref();
+});
 
 

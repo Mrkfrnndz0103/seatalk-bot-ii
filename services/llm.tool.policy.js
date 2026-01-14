@@ -71,9 +71,6 @@ function shouldPrefetchChatHistory(message) {
     "their"
   ]);
   const tokens = normalized.split(/\s+/);
-  if (tokens.length > 0 && tokens.length <= 5) {
-    return true;
-  }
   return tokens.some((token) => pronounTokens.has(token));
 }
 

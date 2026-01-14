@@ -4,6 +4,7 @@ const {
   sendOpenRouterResponse
 } = require("../services/openrouter.client");
 const env = require("../config/env");
+const { logger } = require("../utils/logger");
 
 const DEFAULT_MAX_SNIPPET_CHARS = 800;
 
@@ -82,10 +83,9 @@ async function summarizeWithOpenRouter(question, chunks, sourcesList, options = 
       return reply;
     }
   } catch (error) {
-    console.error(
-      "OpenRouter SDK summary failed:",
-      error.response?.data || error.message
-    );
+    logger.error("openrouter_sdk_summary_failed", {
+      error: error.response?.data || error.message
+    });
   }
 
   try {
@@ -117,10 +117,9 @@ async function summarizeWithOpenRouter(question, chunks, sourcesList, options = 
     const reply = response.data?.choices?.[0]?.message?.content?.trim();
     return reply || "";
   } catch (error) {
-    console.error(
-      "OpenRouter summary failed:",
-      error.response?.data || error.message
-    );
+    logger.error("openrouter_summary_failed", {
+      error: error.response?.data || error.message
+    });
     return "";
   }
 }

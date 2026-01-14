@@ -92,9 +92,7 @@ See `.env.example` for the full list.
 - `SEARCH_LLM_TIMEOUT_MS` caps LLM latency.
 - `SEARCH_LLM_CACHE_TTL_MS` caches LLM summaries for repeated queries.
 
-## Docker
+## Render Deployment
 
-```bash
-docker build -t seatalk-bot .
-docker run --rm -p 3000:3000 --env-file .env seatalk-bot
-```
+- Use `render.yaml` for build/start commands and the `/ready` health check.
+- Attach a persistent disk if you want `INDEX_STORE_PATH` data to survive deploys.

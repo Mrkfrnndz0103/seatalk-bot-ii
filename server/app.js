@@ -1,3 +1,4 @@
+const path = require("path");
 const express = require("express");
 const { rawBodySaver } = require("../src/http/middleware/rawBody");
 const {
@@ -25,6 +26,7 @@ function createApp(options = {}) {
   } = options;
 
   const app = express();
+  const publicDir = path.join(__dirname, "..", "public");
 
   app.use(
     express.json({
@@ -32,6 +34,7 @@ function createApp(options = {}) {
       limit: requestBodyLimit
     })
   );
+  app.use(express.static(publicDir, { fallthrough: true }));
   app.use(
     createRequestContextMiddleware({
       logger,
@@ -52,6 +55,18 @@ function createApp(options = {}) {
   app.use(createSeatalkEventsRouter(seatalkEvents));
   app.use(createSeatalkNotifyRouter(seatalkNotify));
   app.use(createSeatalkCallbackRouter(seatalkCallback));
+  app.get(["/favicon.ico", "/favicon.png"], (req, res) => {
+    const faviconPath = path.join(publicDir, "favicon.png");
+    res.type("png");
+    res.sendFile(faviconPath, (err) => {
+      if (err) {
+        res.status(err.statusCode || 500).end();
+      }
+    });
+  });
+  app.get("/", (req, res) => {
+    res.status(200).send("Seatalk bot service is running.");
+  });
 
   return app;
 }

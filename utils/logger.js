@@ -1,4 +1,10 @@
-const pino = require("pino");
+let pino;
+try {
+  // Fallback to console logging when pino is not installed.
+  pino = require("pino");
+} catch (error) {
+  pino = null;
+}
 
 function formatArgs(args) {
   return args.map((arg) => {
@@ -69,10 +75,55 @@ function buildLogger(baseLogger) {
   };
 }
 
-const rootLogger = pino({
-  level: process.env.LOG_LEVEL || "info",
-  timestamp: pino.stdTimeFunctions.isoTime
-});
+const LOG_LEVELS = {
+  trace: 10,
+  debug: 20,
+  info: 30,
+  warn: 40,
+  error: 50,
+  fatal: 60
+};
+
+function shouldLog(level) {
+  const threshold =
+    LOG_LEVELS[String(process.env.LOG_LEVEL || "info").toLowerCase()] ||
+    LOG_LEVELS.info;
+  return LOG_LEVELS[level] >= threshold;
+}
+
+function createFallbackRootLogger() {
+  const base = {
+    info: (...args) => {
+      if (shouldLog("info")) {
+        console.info(...args);
+      }
+    },
+    warn: (...args) => {
+      if (shouldLog("warn")) {
+        console.warn(...args);
+      }
+    },
+    error: (...args) => {
+      if (shouldLog("error")) {
+        console.error(...args);
+      }
+    },
+    debug: (...args) => {
+      if (shouldLog("debug")) {
+        console.debug(...args);
+      }
+    },
+    child: () => base
+  };
+  return base;
+}
+
+const rootLogger = pino
+  ? pino({
+      level: process.env.LOG_LEVEL || "info",
+      timestamp: pino.stdTimeFunctions.isoTime
+    })
+  : createFallbackRootLogger();
 
 function createLogger(prefix = "") {
   const logger = prefix ? rootLogger.child({ scope: prefix }) : rootLogger;

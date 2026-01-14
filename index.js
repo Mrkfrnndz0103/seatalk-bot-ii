@@ -9,6 +9,7 @@ const { google } = require("googleapis");
 require("dotenv").config();
 const env = require("./config/env");
 const { FileStore } = require("./store/file.store");
+const { SessionStore } = require("./store/session.store");
 const commands = require("./commands");
 const intentService = require("./services/intent.service");
 const groupHandler = require("./services/group.handler");
@@ -16,6 +17,13 @@ const interactiveHandler = require("./services/interactive.handler");
 const scheduler = require("./services/scheduler");
 const { createDriveZipSync } = require("./services/drive.sync");
 const { logger } = require("./utils/logger");
+const { rawBodySaver } = require("./src/http/middleware/rawBody");
+const {
+  createRequestContextMiddleware,
+  createRequestId
+} = require("./src/http/middleware/requestContext");
+const { createRateLimitMiddleware } = require("./src/http/middleware/rateLimit");
+const { getClientIp } = require("./src/http/request.utils");
 const { isValidSignature, getSignatureHeader } = require("./utils/signature");
 const { BotEventType } = require("./events/event.types");
 const { mapSeatalkEventType } = require("./events/event.mapper");
@@ -24,66 +32,13 @@ const { SeatalkMcpClient } = require("./integrations/seatalk.mcp.client");
 const { createSeatalkMcpTools } = require("./integrations/seatalk.mcp.tools");
 const { createLlmAgent } = require("./services/llm.agent");
 const { shouldUseEmployeeLookup } = require("./services/llm.tool.policy");
+const { createSeatalkAuth } = require("./src/seatalk/auth");
+const { createSeatalkMessaging } = require("./src/seatalk/messaging");
+const { createProfileService } = require("./src/profile/profile.service");
+const { createSubscriberHandler } = require("./services/subscriber.handler");
+const { createBacklogsPublisher } = require("./src/backlogs/publisher");
 
 const app = express();
-const rateLimitState = new Map();
-const rateLimitCleanupIntervalMs = Math.max(
-  env.RATE_LIMIT_WINDOW_MS || 0,
-  60 * 1000
-);
-setInterval(() => {
-  const now = Date.now();
-  for (const [ip, entry] of rateLimitState.entries()) {
-    if (!entry || now > entry.resetAt) {
-      rateLimitState.delete(ip);
-    }
-  }
-}, rateLimitCleanupIntervalMs).unref();
-
-function rawBodySaver(req, res, buf) {
-  if (buf && buf.length) {
-    req.rawBody = buf;
-  }
-}
-
-function getClientIp(req) {
-  const forwarded = req.headers["x-forwarded-for"];
-  if (typeof forwarded === "string" && forwarded.trim()) {
-    return forwarded.split(",")[0].trim();
-  }
-  return req.ip || req.connection?.remoteAddress || "unknown";
-}
-
-function rateLimit(req, res, next) {
-  if (!env.RATE_LIMIT_MAX || env.RATE_LIMIT_MAX <= 0) {
-    return next();
-  }
-
-  const ip = getClientIp(req);
-  const now = Date.now();
-  const entry = rateLimitState.get(ip);
-  if (!entry || now > entry.resetAt) {
-    rateLimitState.set(ip, {
-      count: 1,
-      resetAt: now + env.RATE_LIMIT_WINDOW_MS
-    });
-    return next();
-  }
-
-  if (entry.count >= env.RATE_LIMIT_MAX) {
-    return res.status(429).send("Too Many Requests");
-  }
-
-  entry.count += 1;
-  return next();
-}
-
-function createRequestId() {
-  if (typeof crypto.randomUUID === "function") {
-    return crypto.randomUUID();
-  }
-  return crypto.randomBytes(16).toString("hex");
-}
 
 function trackSystemEvent(type, details) {
   trackEvent({
@@ -127,42 +82,30 @@ function validateStartupConfig() {
   }
 }
 
-function requestLogger(req, res, next) {
-  const requestId =
-    req.headers["x-request-id"] || req.requestId || createRequestId();
-  req.requestId = requestId;
-  res.setHeader("x-request-id", requestId);
-
-  const startedAt = Date.now();
-  res.on("finish", () => {
-    logger.info(
-      {
-        requestId,
-        method: req.method,
-        path: req.originalUrl || req.url,
-        statusCode: res.statusCode,
-        latencyMs: Date.now() - startedAt,
-        clientIp: getClientIp(req),
-        userAgent: req.headers["user-agent"] || ""
-      },
-      "request_complete"
-    );
-  });
-
-  next();
-}
-
 app.use(
   express.json({
     verify: rawBodySaver,
     limit: env.REQUEST_BODY_LIMIT
   })
 );
-app.use(requestLogger);
-app.use(rateLimit);
+app.use(
+  createRequestContextMiddleware({
+    logger,
+    getClientIp
+  })
+);
+app.use(
+  createRateLimitMiddleware({
+    max: env.RATE_LIMIT_MAX,
+    windowMs: env.RATE_LIMIT_WINDOW_MS,
+    logger,
+    getIp: getClientIp
+  })
+);
 
 const indexStore = new FileStore({ path: env.INDEX_STORE_PATH });
 indexStore.load();
+const groupSessionStore = new SessionStore();
 
 // ======================
 // Your bot settings
@@ -264,6 +207,44 @@ const llmAgent = createLlmAgent({
   logger
 });
 
+const seatalkAuth = createSeatalkAuth({
+  tokenUrl: SEATALK_TOKEN_URL,
+  appId: SEATALK_APP_ID,
+  appSecret: SEATALK_APP_SECRET,
+  staticToken: STATIC_BOT_ACCESS_TOKEN,
+  httpTimeoutMs: env.SEATALK_HTTP_TIMEOUT_MS,
+  logger
+});
+const { requestWithAuth, postWithAuth } = seatalkAuth;
+
+const seatalkMessaging = createSeatalkMessaging({
+  apiBaseUrl: SEATALK_API_BASE_URL,
+  mcpTools: seatalkMcpTools,
+  postWithAuth,
+  logger,
+  groupTypingUrl: SEATALK_GROUP_TYPING_URL,
+  singleTypingUrl: SEATALK_SINGLE_CHAT_TYPING_URL
+});
+const {
+  sendSubscriberMessage,
+  sendSubscriberTyping,
+  sendGroupMessage,
+  sendGroupTyping
+} = seatalkMessaging;
+
+const profileService = createProfileService({
+  seatalkMcpTools,
+  requestWithAuth,
+  profileUrl: SEATALK_PROFILE_URL,
+  profileMethod: SEATALK_PROFILE_METHOD,
+  profileLookupEnabled: SEATALK_PROFILE_LOOKUP_ENABLED,
+  profileLookupCooldownMs: SEATALK_PROFILE_LOOKUP_COOLDOWN_MS,
+  profileCacheMinutes: SEATALK_PROFILE_CACHE_MINUTES,
+  greetingOverridesJson: env.GREETING_OVERRIDES_JSON,
+  logger
+});
+const { buildGreeting } = profileService;
+
 const runDriveZipSync = createDriveZipSync({
   getDriveApi,
   getSheetsApi,
@@ -290,116 +271,6 @@ const NEW_MENTIONED_MESSAGE_RECEIVED_FROM_GROUP_CHAT = "new_mentioned_message_re
 // ======================
 // Helpers
 // ======================
-
-// Verify signature
-
-const TOKEN_REFRESH_BUFFER_MS = 60 * 1000;
-const TOKEN_FALLBACK_TTL_MS = 2 * 60 * 60 * 1000;
-let cachedAccessToken = null;
-let accessTokenExpiresAtMs = 0;
-let refreshPromise = null;
-
-function hasTokenCredentials() {
-  return Boolean(SEATALK_TOKEN_URL && SEATALK_APP_ID && SEATALK_APP_SECRET);
-}
-
-async function requestAccessToken() {
-  const response = await axios.post(
-    SEATALK_TOKEN_URL,
-    {
-      // Adjust keys to match the Seatalk token endpoint requirements.
-      app_id: SEATALK_APP_ID,
-      app_secret: SEATALK_APP_SECRET
-    },
-    { timeout: env.SEATALK_HTTP_TIMEOUT_MS }
-  );
-
-  const payload = response.data?.data || response.data;
-  const token = payload?.access_token || payload?.app_access_token;
-  const expiresIn = Number(
-    payload?.expires_in ?? payload?.expire_in ?? payload?.expires ?? 0
-  );
-
-  if (!token) {
-    throw new Error("Token endpoint response missing access token.");
-  }
-
-  cachedAccessToken = token;
-  accessTokenExpiresAtMs =
-    Date.now() + (expiresIn > 0 ? expiresIn * 1000 : TOKEN_FALLBACK_TTL_MS);
-  return cachedAccessToken;
-}
-
-async function getAccessToken(options = {}) {
-  const forceRefresh = Boolean(options.forceRefresh);
-
-  if (!hasTokenCredentials()) {
-    if (!STATIC_BOT_ACCESS_TOKEN) {
-      throw new Error(
-        "Missing BOT_ACCESS_TOKEN or Seatalk app credentials for refresh."
-      );
-    }
-    return STATIC_BOT_ACCESS_TOKEN;
-  }
-
-  const now = Date.now();
-  const isFresh =
-    cachedAccessToken &&
-    now < accessTokenExpiresAtMs - TOKEN_REFRESH_BUFFER_MS;
-
-  if (!forceRefresh && isFresh) {
-    return cachedAccessToken;
-  }
-
-  if (!refreshPromise) {
-    refreshPromise = requestAccessToken().finally(() => {
-      refreshPromise = null;
-    });
-  }
-
-  return refreshPromise;
-}
-
-function isUnauthorized(error) {
-  return (
-    error.response?.status === 401 || error.response?.data?.code === 401
-  );
-}
-
-async function requestWithAuth(method, url, payload) {
-  const token = await getAccessToken();
-  const normalizedMethod = String(method || "post").toLowerCase();
-  const config = {
-    method: normalizedMethod,
-    url,
-    timeout: env.SEATALK_HTTP_TIMEOUT_MS,
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json"
-    }
-  };
-
-  if (normalizedMethod === "get") {
-    config.params = payload;
-  } else {
-    config.data = payload;
-  }
-
-  try {
-    return await axios(config);
-  } catch (error) {
-    if (hasTokenCredentials() && isUnauthorized(error)) {
-      const refreshedToken = await getAccessToken({ forceRefresh: true });
-      config.headers.Authorization = `Bearer ${refreshedToken}`;
-      return await axios(config);
-    }
-    throw error;
-  }
-}
-
-async function postWithAuth(url, payload) {
-  return requestWithAuth("post", url, payload);
-}
 
 const TAB_MATCH_MIN_SCORE = 0.65;
 const TAB_SUGGEST_MIN_SCORE = 0.4;
@@ -479,148 +350,6 @@ function tokenize(value) {
 
 function escapeRegExp(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function toTitleCase(value) {
-  return String(value)
-    .toLowerCase()
-    .split(" ")
-    .filter(Boolean)
-    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
-    .join(" ");
-}
-
-function getSeatalkIdentity(event) {
-  const sender = event?.sender || event?.message?.sender || null;
-  return {
-    seatalk_id: event?.seatalk_id || sender?.seatalk_id || null,
-    employee_code: event?.employee_code || sender?.employee_code || null,
-    email: event?.email || sender?.email || null
-  };
-}
-
-function formatUserName(event) {
-  if (event?.name) {
-    return event.name;
-  }
-
-  const sender = event?.sender || event?.message?.sender;
-  const senderName =
-    sender?.name ||
-    sender?.display_name ||
-    sender?.displayName ||
-    sender?.full_name ||
-    sender?.fullName;
-  if (senderName) {
-    return senderName;
-  }
-
-  const identity = getSeatalkIdentity(event);
-  if (identity.email) {
-    const localPart = String(identity.email).split("@")[0] || "";
-    const cleaned = localPart.replace(/[._-]+/g, " ").trim();
-    if (cleaned) {
-      return toTitleCase(cleaned);
-    }
-  }
-
-  if (identity.employee_code) {
-    return `Employee ${identity.employee_code}`;
-  }
-
-  if (identity.seatalk_id) {
-    return `User ${identity.seatalk_id}`;
-  }
-
-  return "there";
-}
-
-function formatFirstName(value) {
-  const cleaned = String(value || "").trim();
-  if (!cleaned) {
-    return "there";
-  }
-  return cleaned.split(/\s+/)[0];
-}
-
-function buildGreetingFromName(name) {
-  const firstName = formatFirstName(name);
-  return `Hello ${firstName} \u{1F44B} How are you today, how can I help \u{1F642}?`;
-}
-
-function getPhilippinesHour() {
-  try {
-    const formatter = new Intl.DateTimeFormat("en-US", {
-      hour: "numeric",
-      hour12: false,
-      timeZone: "Asia/Manila"
-    });
-    const hour = Number(formatter.format(new Date()));
-    if (Number.isFinite(hour)) {
-      return hour;
-    }
-  } catch (error) {
-    // Fall through to manual calc.
-  }
-
-  const utcHour = new Date().getUTCHours();
-  return (utcHour + 8) % 24;
-}
-
-function getTimeOfDayGreeting() {
-  const hour = getPhilippinesHour();
-  if (hour < 12) {
-    return "Good Morning";
-  }
-  if (hour < 18) {
-    return "Good Afternoon";
-  }
-  return "Good Evening";
-}
-
-function getTitleForProfile(profile) {
-  const email = String(profile.email || "").toLowerCase();
-  const isSpx = email.endsWith("@spxexpress.com");
-  if (!isSpx) {
-    return "";
-  }
-
-  if (profile.gender === "female") {
-    return "Ma'am";
-  }
-
-  return "Sir";
-}
-
-function getGreetingOverride(profile) {
-  const email = String(profile.email || "").toLowerCase();
-  if (!email) {
-    return null;
-  }
-  const override = greetingOverrides.get(email);
-  if (!override) {
-    return null;
-  }
-
-  const title = override.gender === "female" ? "Ma'am" : "Sir";
-  return `Hello ${title} ${override.name} \u{1F44B}, How can I assist you today?`;
-}
-
-async function buildGreeting(event) {
-  const profile = await getSeatalkProfileDetails(event);
-  const override = getGreetingOverride(profile);
-  if (override) {
-    return override;
-  }
-
-  const name = formatFirstName(profile.name);
-  const title = getTitleForProfile(profile);
-  const timeGreeting = getTimeOfDayGreeting();
-  if (title) {
-    return `Hello ${title} ${name} \u{1F44B} ${timeGreeting}!\nHow can I assist you today?`;
-  }
-
-  return `Hello ${name} \u{1F44B} ${timeGreeting}!\nHow can I assist you today?`;
 }
 
 function getEventMessageText(event) {
@@ -751,418 +480,7 @@ function stripBotMention(text) {
   return text.replace(mentionPattern, "").replace(/\s+/g, " ").trim();
 }
 
-const profileCache = new Map();
-let profileLookupDisabledUntilMs = 0;
-
-function shouldSkipProfileLookup() {
-  if (!SEATALK_PROFILE_LOOKUP_ENABLED) {
-    return true;
-  }
-  if (
-    profileLookupDisabledUntilMs &&
-    Date.now() < profileLookupDisabledUntilMs
-  ) {
-    return true;
-  }
-  return false;
-}
-
-function getSeatalkErrorCode(error) {
-  const code =
-    error?.normalized?.code ||
-    error?.payload?.code ||
-    error?.response?.data?.code;
-  return Number.isFinite(Number(code)) ? Number(code) : null;
-}
-
-function disableProfileLookupTemporarily(reason) {
-  if (!SEATALK_PROFILE_LOOKUP_COOLDOWN_MS) {
-    return;
-  }
-  profileLookupDisabledUntilMs =
-    Date.now() + SEATALK_PROFILE_LOOKUP_COOLDOWN_MS;
-  if (logger && typeof logger.warn === "function") {
-    logger.warn("profile_lookup_disabled", {
-      reason,
-      untilMs: profileLookupDisabledUntilMs
-    });
-  }
-}
-function loadGreetingOverrides(raw) {
-  const overrides = new Map();
-  if (!raw) {
-    return overrides;
-  }
-
-  try {
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object") {
-      return overrides;
-    }
-    Object.entries(parsed).forEach(([email, value]) => {
-      const normalizedEmail = String(email || "").toLowerCase().trim();
-      if (!normalizedEmail || !value || typeof value !== "object") {
-        return;
-      }
-      overrides.set(normalizedEmail, {
-        name: value.name || "",
-        gender: value.gender || null,
-        omitTimeGreeting: Boolean(value.omitTimeGreeting)
-      });
-    });
-  } catch (error) {
-    logger.warn("greeting_overrides_invalid", { error: error.message });
-  }
-
-  return overrides;
-}
-
-const greetingOverrides = loadGreetingOverrides(env.GREETING_OVERRIDES_JSON);
-
-function getProfileCacheKey(event) {
-  const identity = getSeatalkIdentity(event);
-  return identity.seatalk_id || identity.employee_code || identity.email || null;
-}
-
-function getCachedProfile(key) {
-  if (!key || !profileCache.has(key)) {
-    return null;
-  }
-
-  const entry = profileCache.get(key);
-  if (!entry || Date.now() > entry.expiresAtMs) {
-    profileCache.delete(key);
-    return null;
-  }
-
-  return entry;
-}
-
-function cacheProfile(key, profile) {
-  if (!key || !profile || !profile.name || SEATALK_PROFILE_CACHE_MINUTES <= 0) {
-    return;
-  }
-
-  profileCache.set(key, {
-    name: profile.name,
-    gender: profile.gender || null,
-    email: profile.email || null,
-    expiresAtMs: Date.now() + SEATALK_PROFILE_CACHE_MINUTES * 60 * 1000
-  });
-}
-
-function normalizeGender(value) {
-  if (value === null || value === undefined) {
-    return null;
-  }
-
-  if (typeof value === "boolean") {
-    return value ? "male" : "female";
-  }
-
-  const normalized = String(value).toLowerCase().trim();
-  if (["m", "male", "man", "boy", "1"].includes(normalized)) {
-    return "male";
-  }
-  if (["f", "female", "woman", "girl", "2"].includes(normalized)) {
-    return "female";
-  }
-
-  if (normalized.includes("mr") || normalized.includes("sir")) {
-    return "male";
-  }
-  if (
-    normalized.includes("ms") ||
-    normalized.includes("mrs") ||
-    normalized.includes("miss") ||
-    normalized.includes("maam") ||
-    normalized.includes("ma'am")
-  ) {
-    return "female";
-  }
-
-  return null;
-}
-
-function extractGender(profile) {
-  if (!profile) {
-    return null;
-  }
-
-  const candidates = [
-    profile.gender,
-    profile.sex,
-    profile.gender_code,
-    profile.is_male,
-    profile.isMale,
-    profile.is_female,
-    profile.isFemale,
-    profile.title
-  ];
-
-  for (const candidate of candidates) {
-    const normalized = normalizeGender(candidate);
-    if (normalized) {
-      return normalized;
-    }
-  }
-
-  const name = extractDisplayName(profile);
-  if (name) {
-    const lower = name.toLowerCase();
-    if (lower.startsWith("mr ") || lower.startsWith("sir ")) {
-      return "male";
-    }
-    if (
-      lower.startsWith("ms ") ||
-      lower.startsWith("mrs ") ||
-      lower.startsWith("miss ") ||
-      lower.startsWith("ma'am ") ||
-      lower.startsWith("maam ")
-    ) {
-      return "female";
-    }
-  }
-
-  return null;
-}
-
-function extractDisplayName(profile) {
-  if (!profile) {
-    return null;
-  }
-
-  if (Array.isArray(profile)) {
-    return extractDisplayName(profile[0]);
-  }
-
-  if (typeof profile === "string") {
-    return profile.trim() || null;
-  }
-
-  const candidates = [
-    profile.name,
-    profile.display_name,
-    profile.displayName,
-    profile.employee_name,
-    profile.user_name,
-    profile.full_name,
-    profile.fullName,
-    profile.nickname,
-    profile.user?.name,
-    profile.user?.display_name,
-    profile.employee?.name,
-    profile.employee?.display_name
-  ];
-
-  for (const candidate of candidates) {
-    if (typeof candidate === "string" && candidate.trim()) {
-      return candidate.trim();
-    }
-  }
-
-  return null;
-}
-
-function extractEmail(profile) {
-  if (!profile) {
-    return null;
-  }
-
-  const candidates = [
-    profile.company_email,
-    profile.email,
-    profile.companyEmail,
-    profile.user?.email,
-    profile.employee?.email
-  ];
-
-  for (const candidate of candidates) {
-    if (typeof candidate === "string" && candidate.trim()) {
-      return candidate.trim();
-    }
-  }
-
-  return null;
-}
-
-function resolveEmployeeCode(result, email) {
-  const results = result?.results || [];
-  const match = results.find(
-    (entry) =>
-      entry?.exists &&
-      String(entry.email || "").toLowerCase() === String(email || "").toLowerCase()
-  );
-  if (match?.employee_code) {
-    return match.employee_code;
-  }
-  const first = results.find((entry) => entry?.exists && entry?.employee_code);
-  return first?.employee_code || null;
-}
-
-async function fetchSeatalkProfileViaMcp(event) {
-  if (!seatalkMcpTools) {
-    return null;
-  }
-  if (shouldSkipProfileLookup()) {
-    return null;
-  }
-
-  const identity = getSeatalkIdentity(event);
-  let employeeCode = identity.employee_code || null;
-
-  if (!employeeCode && identity.email) {
-    const lookup = await seatalkMcpTools.tools.get_employee_code_with_email({
-      emails: [identity.email]
-    });
-    if (lookup?.code === 0) {
-      employeeCode = resolveEmployeeCode(lookup, identity.email);
-    }
-  }
-
-  if (!employeeCode) {
-    return null;
-  }
-
-  const response = await seatalkMcpTools.tools.get_employee_profile({
-    employee_code: employeeCode
-  });
-  if (response?.code === 103) {
-    disableProfileLookupTemporarily("permission_denied");
-    return null;
-  }
-  if (response?.code !== 0) {
-    return null;
-  }
-
-  const profile = response.employee || response.profile || response.data;
-  return {
-    name: extractDisplayName(profile),
-    gender: extractGender(profile),
-    email: extractEmail(profile)
-  };
-}
-
-async function fetchSeatalkProfile(event) {
-  if (shouldSkipProfileLookup()) {
-    return null;
-  }
-
-  if (seatalkMcpTools) {
-    try {
-      const profile = await fetchSeatalkProfileViaMcp(event);
-      if (profile?.name) {
-        return profile;
-      }
-    } catch (error) {
-      if (getSeatalkErrorCode(error) === 103) {
-        disableProfileLookupTemporarily("permission_denied");
-      }
-      logger.warn("mcp_profile_lookup_failed", { error: error.message });
-    }
-  }
-
-  if (!SEATALK_PROFILE_URL) {
-    return null;
-  }
-
-  const identity = getSeatalkIdentity(event);
-  const payload = {};
-  if (identity.seatalk_id) {
-    payload.seatalk_id = identity.seatalk_id;
-  }
-  if (identity.employee_code) {
-    payload.employee_code = identity.employee_code;
-  }
-  if (identity.email) {
-    payload.email = identity.email;
-  }
-
-  if (!Object.keys(payload).length) {
-    return null;
-  }
-
-  try {
-    const response = await requestWithAuth(
-      SEATALK_PROFILE_METHOD,
-      SEATALK_PROFILE_URL,
-      payload
-    );
-    const data = response.data?.data ?? response.data;
-    return {
-      name: extractDisplayName(data),
-      gender: extractGender(data),
-      email: extractEmail(data)
-    };
-  } catch (error) {
-    if (getSeatalkErrorCode(error) === 103) {
-      disableProfileLookupTemporarily("permission_denied");
-    }
-    logger.warn("seatalk_profile_lookup_failed", {
-      error: error.response?.data || error.message
-    });
-    return null;
-  }
-}
-
-async function fetchSeatalkProfileName(event) {
-  const profile = await fetchSeatalkProfile(event);
-  return profile?.name || null;
-}
-
-async function getSeatalkDisplayName(event) {
-  if (event?.name) {
-    return event.name;
-  }
-
-  const cacheKey = getProfileCacheKey(event);
-  const cached = getCachedProfile(cacheKey);
-  if (cached?.name) {
-    return cached.name;
-  }
-
-  const fetched = await fetchSeatalkProfile(event);
-  if (fetched?.name) {
-    cacheProfile(cacheKey, {
-      name: fetched.name,
-      gender: fetched.gender,
-      email: getSeatalkIdentity(event).email || null
-    });
-    return fetched.name;
-  }
-
-  return formatUserName(event);
-}
-
-async function getSeatalkProfileDetails(event) {
-  const cacheKey = getProfileCacheKey(event);
-  const cached = getCachedProfile(cacheKey);
-  const identity = getSeatalkIdentity(event);
-  if (cached?.name) {
-    return {
-      name: cached.name,
-      gender: cached.gender,
-      email: cached.email || identity.email || null
-    };
-  }
-
-  const fetched = await fetchSeatalkProfile(event);
-  if (fetched?.name) {
-    const profile = {
-      name: fetched.name,
-      gender: fetched.gender,
-      email: identity.email || null
-    };
-    cacheProfile(cacheKey, profile);
-    return profile;
-  }
-
-  return {
-    name: formatUserName(event),
-    gender: null,
-    email: identity.email || null
-  };
-}
+// Profile lookup moved to src/profile/profile.service.js
 
 function getPositiveLead() {
   const options = [
@@ -1455,331 +773,24 @@ async function fetchSheetTabId(spreadsheetId, tabName) {
   return match?.properties?.sheetId || null;
 }
 
-function buildSheetPngExportUrl(spreadsheetId, gid, range) {
-  const gidParam = gid ? `&gid=${gid}` : "";
-  const rangeParam = range ? `&range=${encodeURIComponent(range)}` : "";
-  return `https://docs.google.com/spreadsheets/d/${spreadsheetId}/export?format=png${gidParam}${rangeParam}`;
-}
-
-function isHtmlResponse(data, headers = {}) {
-  const contentType = String(headers["content-type"] || "").toLowerCase();
-  if (contentType.includes("text/html")) {
-    return true;
-  }
-  if (!data) {
-    return false;
-  }
-  const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data);
-  const prefix = buffer.slice(0, 32).toString("utf8").toLowerCase().trim();
-  return prefix.startsWith("<!doctype html") || prefix.startsWith("<html");
-}
-
-async function tryFetchSheetPng(exportUrl, token, source) {
-  const headers = {};
-  if (token) {
-    headers.Authorization = `Bearer ${token}`;
-  }
-  try {
-    const response = await axios.get(exportUrl, {
-      responseType: "arraybuffer",
-      headers,
-      validateStatus: () => true
-    });
-    if (
-      response.status >= 200 &&
-      response.status < 300 &&
-      !isHtmlResponse(response.data, response.headers)
-    ) {
-      return { ok: true, data: response.data };
-    }
-    return {
-      ok: false,
-      error: {
-        source,
-        status: response.status,
-        contentType: response.headers?.["content-type"] || ""
-      }
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      error: {
-        source,
-        status: error.response?.status || null,
-        message: error.message
-      }
-    };
-  }
-}
-
-async function fetchSheetPngBase64(spreadsheetId, tabName, range) {
-  if (!spreadsheetId) {
-    return null;
-  }
-
-  let gid = BACKLOGS_IMAGE_GID || "";
-  if (!gid && tabName) {
-    gid = await fetchSheetTabId(spreadsheetId, tabName);
-  }
-
-  const exportUrl = buildSheetPngExportUrl(spreadsheetId, gid, range);
-  const attempts = [];
-  const candidates = await getGoogleAccessTokenCandidates();
-
-  for (const candidate of candidates) {
-    const result = await tryFetchSheetPng(
-      exportUrl,
-      candidate.token,
-      candidate.source
-    );
-    if (result.ok) {
-      return Buffer.from(result.data).toString("base64");
-    }
-    if (result.error) {
-      attempts.push(result.error);
-    }
-  }
-
-  if (!candidates.length) {
-    const result = await tryFetchSheetPng(exportUrl, null, "unauthenticated");
-    if (result.ok) {
-      return Buffer.from(result.data).toString("base64");
-    }
-    if (result.error) {
-      attempts.push(result.error);
-    }
-  }
-
-  if (attempts.length && logger && typeof logger.warn === "function") {
-    logger.warn("backlogs_image_fetch_failed", { attempts });
-  }
-  return null;
-}
-
-function escapeSheetTabName(tabName) {
-  const trimmed = String(tabName || "").trim();
-  if (!trimmed) {
-    return "";
-  }
-  if (trimmed.includes("'")) {
-    return `'${trimmed.replace(/'/g, "''")}'`;
-  }
-  if (/\s/.test(trimmed)) {
-    return `'${trimmed}'`;
-  }
-  return trimmed;
-}
-
-function buildBacklogsMonitorRange(tabName, range) {
-  const trimmedRange = String(range || "").trim();
-  if (!trimmedRange) {
-    return "";
-  }
-  if (trimmedRange.includes("!")) {
-    return trimmedRange;
-  }
-  const safeTab = escapeSheetTabName(tabName);
-  return safeTab ? `${safeTab}!${trimmedRange}` : trimmedRange;
-}
-
-function computeRangeSignature(values) {
-  const payload = JSON.stringify(values || []);
-  return crypto.createHash("sha256").update(payload).digest("hex");
-}
-
-function loadBacklogsMonitorState() {
-  if (!BACKLOGS_MONITOR_STATE_PATH) {
-    return {};
-  }
-  if (!fs.existsSync(BACKLOGS_MONITOR_STATE_PATH)) {
-    return {};
-  }
-  try {
-    const raw = fs.readFileSync(BACKLOGS_MONITOR_STATE_PATH, "utf8");
-    return raw ? JSON.parse(raw) : {};
-  } catch (error) {
-    logger.warn("backlogs_monitor_state_read_failed", {
-      error: error.message
-    });
-    return {};
-  }
-}
-
-function updateBacklogsMonitorState(nextState) {
-  if (!nextState || typeof nextState !== "object") {
-    return;
-  }
-  backlogsMonitorState = {
-    ...(backlogsMonitorState || {}),
-    ...nextState
-  };
-
-  if (!BACKLOGS_MONITOR_STATE_PATH) {
-    return;
-  }
-  const dir = path.dirname(BACKLOGS_MONITOR_STATE_PATH);
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
-  }
-  fs.writeFileSync(
-    BACKLOGS_MONITOR_STATE_PATH,
-    JSON.stringify(backlogsMonitorState, null, 2)
-  );
-}
-
-async function fetchBacklogsMonitorSignature() {
-  if (!BACKLOGS_IMAGE_SHEET_ID) {
-    return null;
-  }
-  const monitorRange = buildBacklogsMonitorRange(
-    BACKLOGS_IMAGE_TAB_NAME,
-    BACKLOGS_MONITOR_RANGE || BACKLOGS_IMAGE_RANGE
-  );
-  if (!monitorRange) {
-    logger.warn("backlogs_monitor_missing_range");
-    return null;
-  }
-  const values = await readSheetRange(BACKLOGS_IMAGE_SHEET_ID, monitorRange);
-  if (values === null) {
-    return null;
-  }
-  return computeRangeSignature(values);
-}
-
-let backlogsMonitorState = loadBacklogsMonitorState();
-
-function formatBacklogsTimestamp(date = new Date()) {
-  const timeZone = BACKLOGS_TIMEZONE || "UTC";
-  try {
-    const timeLabel = new Intl.DateTimeFormat("en-US", {
-      hour: "numeric",
-      minute: "2-digit",
-      hour12: true,
-      timeZone
-    }).format(date);
-    const dateLabel = new Intl.DateTimeFormat("en-US", {
-      year: "numeric",
-      month: "short",
-      day: "2-digit",
-      timeZone
-    }).format(date);
-    return `${timeLabel} - ${dateLabel}`;
-  } catch (error) {
-    const timeLabel = new Intl.DateTimeFormat("en-US", {
-      hour: "numeric",
-      minute: "2-digit",
-      hour12: true
-    }).format(date);
-    const dateLabel = new Intl.DateTimeFormat("en-US", {
-      year: "numeric",
-      month: "short",
-      day: "2-digit"
-    }).format(date);
-    return `${timeLabel} - ${dateLabel}`;
-  }
-}
-
-function buildBacklogsScheduledText(date = new Date()) {
-  const timestamp = formatBacklogsTimestamp(date);
-  return `@all Sharing OB Pending for Dispatch as of ${timestamp}`;
-}
-
-let backlogsUpdateInFlight = false;
-async function sendBacklogsScheduledUpdate() {
-  if (!BACKLOGS_SCHEDULED_GROUP_ID) {
-    return;
-  }
-  if (!BACKLOGS_IMAGE_SHEET_ID) {
-    logger.warn("backlogs_schedule_missing_sheet_id");
-    return;
-  }
-  if (backlogsUpdateInFlight) {
-    logger.warn("backlogs_schedule_skip_overlap");
-    return;
-  }
-
-  backlogsUpdateInFlight = true;
-  try {
-    const nowIso = new Date().toISOString();
-    const signature = await fetchBacklogsMonitorSignature();
-    if (!signature) {
-      updateBacklogsMonitorState({ lastCheckedAt: nowIso });
-      logger.warn("backlogs_monitor_signature_failed");
-      return;
-    }
-
-    if (!backlogsMonitorState?.lastSignature) {
-      updateBacklogsMonitorState({
-        lastSignature: signature,
-        lastCheckedAt: nowIso,
-        baselineAt: nowIso
-      });
-      logger.info("backlogs_monitor_baseline_set");
-      return;
-    }
-
-    if (backlogsMonitorState.lastSignature === signature) {
-      updateBacklogsMonitorState({ lastCheckedAt: nowIso });
-      logger.info("backlogs_monitor_no_change");
-      return;
-    }
-
-    const messageText = buildBacklogsScheduledText(new Date());
-    if (!messageText) {
-      logger.warn("backlogs_schedule_missing_text");
-      return;
-    }
-
-    const imageBase64 = await fetchSheetPngBase64(
-      BACKLOGS_IMAGE_SHEET_ID,
-      BACKLOGS_IMAGE_TAB_NAME,
-      BACKLOGS_IMAGE_RANGE
-    );
-    if (!imageBase64) {
-      logger.warn("backlogs_schedule_missing_image");
-      return;
-    }
-
-    const imageSent = await sendGroupMessage(BACKLOGS_SCHEDULED_GROUP_ID, {
-      tag: "image",
-      image: {
-        content: imageBase64
-      }
-    });
-    if (!imageSent) {
-      logger.warn("backlogs_schedule_image_send_failed");
-      return;
-    }
-
-    const textSent = await sendGroupMessage(
-      BACKLOGS_SCHEDULED_GROUP_ID,
-      messageText
-    );
-    if (!textSent) {
-      logger.warn("backlogs_schedule_text_send_failed");
-      return;
-    }
-    updateBacklogsMonitorState({
-      lastSignature: signature,
-      lastCheckedAt: nowIso,
-      lastSentAt: nowIso,
-      lastChangeAt: nowIso
-    });
-    trackSystemEvent(BotEventType.BACKLOGS_SCHEDULED, {
-      groupId: BACKLOGS_SCHEDULED_GROUP_ID
-    });
-    logger.info("backlogs_schedule_sent", {
-      groupId: BACKLOGS_SCHEDULED_GROUP_ID,
-      hasImage: Boolean(imageBase64)
-    });
-  } catch (error) {
-    logger.error("backlogs_schedule_failed", {
-      error: error.response?.data || error.message
-    });
-  } finally {
-    backlogsUpdateInFlight = false;
-  }
-}
+const backlogsPublisher = createBacklogsPublisher({
+  sheetId: BACKLOGS_IMAGE_SHEET_ID,
+  tabName: BACKLOGS_IMAGE_TAB_NAME,
+  imageRange: BACKLOGS_IMAGE_RANGE,
+  monitorRange: BACKLOGS_MONITOR_RANGE,
+  monitorStatePath: BACKLOGS_MONITOR_STATE_PATH,
+  timezone: BACKLOGS_TIMEZONE,
+  groupId: BACKLOGS_SCHEDULED_GROUP_ID,
+  imageGid: BACKLOGS_IMAGE_GID,
+  readSheetRange,
+  fetchSheetTabId,
+  getGoogleAccessTokenCandidates,
+  sendGroupMessage,
+  trackEvent: (details) =>
+    trackSystemEvent(BotEventType.BACKLOGS_SCHEDULED, details),
+  logger
+});
+const { sendBacklogsScheduledUpdate } = backlogsPublisher;
 
 const SHEET_STOPWORDS = new Set([
   "the",
@@ -2170,363 +1181,31 @@ async function generateIntelligentReply(userMessage, options = {}) {
   });
 }
 
-async function handleSubscriberMessage(event, ctx = {}) {
-  const requestId = ctx.requestId || "unknown";
-  const log = ctx.logger || logger;
-  const startedAt = Date.now();
-    const track = typeof ctx.trackEvent === "function" ? ctx.trackEvent : null;
-
-  try {
-    const employee_code = event.employee_code;
-    const rawText = getEventMessageText(event).trim();
-    const msgText = stripBotMention(rawText);
-    const replyWithText = async (text, options = {}) => {
-      if (!text) {
-        return;
-      }
-      const lead = options.addLead ? getPositiveLead() : "";
-      const content = lead ? `${lead}\n\n${text}` : text;
-      await replyToSubscriber(employee_code, content);
-    };
-
-    if (!employee_code) {
-      log.warn("subscriber_missing_employee_code", { requestId });
-      if (track) {
-        track(BotEventType.ERROR, { reason: "missing_employee_code" });
-      }
-      return;
-    }
-
-    sendSubscriberTyping(employee_code).catch((error) => {
-      log.warn("subscriber_typing_failed", {
-        requestId,
-        error: error.message
-      });
-    });
-
-    if (!msgText) {
-      await replyWithText("I can only read text messages right now.");
-      return;
-    }
-
-    if (isGreetingOnly(msgText)) {
-      const greeting = await buildGreeting(event);
-      await replyToSubscriber(employee_code, greeting);
-      return;
-    }
-
-    const parsedCommand =
-      typeof commands.parseCommand === "function"
-        ? commands.parseCommand(msgText)
-        : null;
-    const isHelp = !parsedCommand && isHelpRequest(msgText);
-    if (parsedCommand) {
-      log.info("command_received", {
-        requestId,
-        command: parsedCommand.cmd
-      });
-      if (track) {
-        track(BotEventType.COMMAND, { command: parsedCommand.cmd });
-        if (parsedCommand.cmd === "help") {
-          track(BotEventType.HELP_REQUEST, { command: parsedCommand.cmd });
-        } else if (!KNOWN_COMMANDS.has(parsedCommand.cmd)) {
-          track(BotEventType.INVALID_COMMAND, { command: parsedCommand.cmd });
-        }
-      }
-    } else if (isHelp && track) {
-      track(BotEventType.HELP_REQUEST, { source: "keyword" });
-    }
-
-    if (isHelp) {
-      const helpReply = await commands.handle("/help", {
-        store: indexStore,
-        logger: log,
-        requestId
-      });
-      if (helpReply && helpReply.text) {
-        await replyWithText(helpReply.text);
-        return;
-      }
-    }
-
-    if (isGreetingOnly(msgText)) {
-      const greeting = await buildGreeting(event);
-      await replyToSubscriber(employee_code, greeting);
-      return;
-    }
-
-    if (isAgeQuestion(msgText)) {
-      await replyWithText(
-        "I don't have a real age. I'm a bot here to help you with questions."
-      );
-      return;
-    }
-
-    if (isConversational(msgText)) {
-      const convoReply = await generateIntelligentReply(msgText, {
-        skipSheetContext: true,
-        conversation: true,
-        useTools: false,
-        logger: log,
-        requestId
-      });
-      await replyWithText(convoReply || "I'm here if you need anything.");
-      return;
-    }
-
-    const commandReply = await commands.handle(msgText, {
-      store: indexStore,
-      logger: log,
-      requestId
-    });
-    if (commandReply && commandReply.text) {
-      await replyWithText(commandReply.text);
-      return;
-    }
-
-    const intentType = intentService.detectIntent(msgText);
-    if (intentType && track) {
-      track(BotEventType.KEYWORD_TRIGGER, { intent: intentType });
-    }
-
-    const intentReply = await intentService.handleIntentMessage(msgText, {
-      sheetCache,
-      refreshSheetCache,
-      readSheetRange
-    });
-    if (intentReply && intentReply.text) {
-      await replyWithText(intentReply.text, { addLead: true });
-      return;
-    }
-
-    if (shouldUseEmployeeLookup(msgText)) {
-      const lookupReply = await generateIntelligentReply(msgText, {
-        skipSheetContext: true,
-        conversation: false
-      });
-      await replyWithText(lookupReply || "I couldn't find that employee.");
-      return;
-    }
-
-    const loadedIndex = Array.isArray(indexStore.items) ? indexStore.items : [];
-    if (!loadedIndex.length) {
-      await replyWithText("Index is empty. Run /reindex to build it.");
-      return;
-    }
-
-    const searchReply = await commands.handle(`/search ${msgText}`, {
-      store: indexStore,
-      topK: 3,
-      fallbackIfEmpty: true,
-      logger: log,
-      requestId
-    });
-    if (searchReply && searchReply.text) {
-      await replyWithText(searchReply.text, { addLead: true });
-      return;
-    }
-
-    if (track) {
-      track(BotEventType.FALLBACK, { reason: "no_intent_no_search" });
-    }
-
-    const fallbackReply = await generateIntelligentReply(msgText, {
-      skipSheetContext: false,
-      logger: log,
-      requestId
-    });
-    await replyWithText(fallbackReply || "Thanks for your message.");
-  } catch (error) {
-    log.error("subscriber_message_error", {
-      requestId,
-      error: error.message
-    });
-    if (track) {
-      track(BotEventType.ERROR, { error: error.message });
-    }
-    if (event?.employee_code) {
-      await replyToSubscriber(
-        event.employee_code,
-        "Sorry, I ran into an error while processing your request."
-      );
-    }
-  } finally {
-    log.info("subscriber_message_handled", {
-      requestId,
-      durationMs: Date.now() - startedAt
-    });
-  }
-}
-
-
-
-// Send text message to subscriber
-async function replyToSubscriber(employee_code, content) {
-  const messagePayload = {
-    tag: "text",
-    text: {
-      format: 1, // 1 = markdown, 2 = plain text
-      content: content
-    }
-  };
-
-  if (seatalkMcpTools) {
-    try {
-      const response = await seatalkMcpTools.sendMessageToBotUser(
-        employee_code,
-        messagePayload
-      );
-      if (response?.code === 0) {
-        logger.info("subscriber_message_sent", {
-          messageId: response.message_id
-        });
-        return;
-      }
-      if (response?.code) {
-        logger.error("subscriber_message_failed", { response });
-      }
-    } catch (error) {
-      logger.error("subscriber_message_error", {
-        error: error.message || error
-      });
-    }
-  }
-
-  try {
-    const response = await postWithAuth(
-      `${SEATALK_API_BASE_URL}/messaging/v2/single_chat`,
-      {
-        employee_code: employee_code,
-        message: messagePayload,
-        usable_platform: "all"
-      }
-    );
-
-    if (response.data.code === 0) {
-      logger.info("subscriber_message_sent", {
-        messageId: response.data.message_id
-      });
-    } else {
-      logger.error("subscriber_message_failed", { response: response.data });
-    }
-  } catch (err) {
-    logger.error("subscriber_message_error", {
-      error: err.response?.data || err.message
-    });
-  }
-}
-
-async function sendSubscriberTyping(employeeCode) {
-  if (!SEATALK_SINGLE_CHAT_TYPING_URL) {
-    return;
-  }
-  if (!employeeCode) {
-    return;
-  }
-
-  await postWithAuth(SEATALK_SINGLE_CHAT_TYPING_URL, {
-    employee_code: employeeCode
-  });
-}
-
-function buildGroupMessagePayload(content) {
-  if (content && typeof content === "object" && content.tag) {
-    return content;
-  }
-  if (content && typeof content === "object") {
-    const nestedText =
-      typeof content.text === "string"
-        ? content.text
-        : content.text?.content;
-    if (nestedText) {
-      return {
-        tag: "text",
-        text: {
-          format: 1,
-          content: String(nestedText)
-        }
-      };
-    }
-  }
-  const text = String(content || "").trim();
-  if (!text) {
-    return null;
-  }
-  return {
-    tag: "text",
-    text: {
-      format: 1,
-      content: text
-    }
-  };
-}
-
-async function sendGroupMessage(group_id, content) {
-  const messagePayload = buildGroupMessagePayload(content);
-  if (!messagePayload) {
-    throw new Error("Missing group message content.");
-  }
-
-  if (seatalkMcpTools) {
-    try {
-      const response = await seatalkMcpTools.sendMessageToGroupChat(
-        group_id,
-        messagePayload
-      );
-      if (response?.code === 0) {
-        logger.info("group_message_sent", { messageId: response.message_id });
-        return true;
-      }
-      if (response?.code) {
-        logger.error("group_message_failed", { response });
-      }
-    } catch (error) {
-      logger.error("group_message_error", {
-        error: error.message || error
-      });
-    }
-  }
-
-  try {
-    const response = await postWithAuth(
-      `${SEATALK_API_BASE_URL}/messaging/v2/group_chat`,
-      {
-        group_id,
-        message: messagePayload,
-        usable_platform: "all"
-      }
-    );
-
-    if (response.data.code === 0) {
-      logger.info("group_message_sent", {
-        messageId: response.data.message_id
-      });
-      return true;
-    }
-    logger.error("group_message_failed", { response: response.data });
-  } catch (err) {
-    logger.error("group_message_error", {
-      error: err.response?.data || err.message
-    });
-  }
-  return false;
-}
-
-async function sendGroupTyping(groupId, threadId) {
-  if (!SEATALK_GROUP_TYPING_URL) {
-    return;
-  }
-  if (!groupId) {
-    return;
-  }
-
-  const payload = { group_id: groupId };
-  if (threadId) {
-    payload.thread_id = threadId;
-  }
-
-  await postWithAuth(SEATALK_GROUP_TYPING_URL, payload);
-}
+const handleSubscriberMessage = createSubscriberHandler({
+  BotEventType,
+  logger,
+  stripBotMention,
+  isGreetingOnly,
+  isHelpRequest,
+  isAgeQuestion,
+  isConversational,
+  getPositiveLead,
+  generateIntelligentReply,
+  shouldUseEmployeeLookup,
+  parseCommand: commands.parseCommand,
+  handleCommand: commands.handle,
+  detectIntent: intentService.detectIntent,
+  handleIntentMessage: intentService.handleIntentMessage,
+  sheetCache,
+  refreshSheetCache,
+  readSheetRange,
+  indexStore,
+  knownCommands: KNOWN_COMMANDS,
+  buildGreeting,
+  getEventMessageText,
+  sendSubscriberMessage,
+  sendSubscriberTyping
+});
 
 // ======================
 // Google OAuth for Sheets
@@ -2683,7 +1362,7 @@ app.post("/seatalk/notify", async (req, res) => {
   }
 
   if (employee_code) {
-    await replyToSubscriber(employee_code, message);
+    await sendSubscriberMessage(employee_code, message);
     return res.json({ status: "ok", target: "dm" });
   }
 
@@ -2806,7 +1485,8 @@ app.post("/seatalk/callback", (req, res) => {
             sendGroupMessage,
             sendGroupTyping,
             postWithAuth,
-            apiBaseUrl: SEATALK_API_BASE_URL
+            apiBaseUrl: SEATALK_API_BASE_URL,
+            sessionStore: groupSessionStore
           })
           .catch((err) => {
             logger.error("group_mention_failed", {
@@ -2881,5 +1561,3 @@ process.on("SIGTERM", () => {
     process.exit(1);
   }, 10000).unref();
 });
-
-

@@ -327,7 +327,7 @@ async function handleGroupMention(event, deps) {
       match: (text) =>
         text.includes("tell him to rest") && text.includes("na"),
       reply:
-        "Beep boop! 🤖 Sir Greg, the bot has detected tired eyes. Command: sleep mode activated! 😄😴"
+        "Attention! 🤖 Sir Greg, the bot has detected tired eyes. time to get some rest and recharge those eyes! 😴"
     }
   ];
   const canned = cannedReplies.find((entry) => entry.match(normalizedText));

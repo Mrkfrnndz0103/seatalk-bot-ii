@@ -42,7 +42,7 @@ function createSeatalkCallbackRouter(options = {}) {
 
   const router = express.Router();
 
-  router.post("/seatalk/callback", (req, res) => {
+  router.post("/seatalk/callback", async (req, res) => {
     const requestId =
       req.requestId || req.headers["x-request-id"] || createRequestId();
     const startedAt = Date.now();
@@ -88,7 +88,7 @@ function createSeatalkCallbackRouter(options = {}) {
 
         case MESSAGE_FROM_BOT_SUBSCRIBER:
           logger?.info?.("subscriber_message", { requestId });
-          handleSubscriberMessage(data.event, {
+          await handleSubscriberMessage(data.event, {
             requestId,
             logger,
             trackEvent: track
@@ -105,7 +105,7 @@ function createSeatalkCallbackRouter(options = {}) {
 
         case INTERACTIVE_MESSAGE_CLICK:
           logger?.info?.("interactive_message_click", { requestId });
-          interactiveHandler
+          await interactiveHandler
             .handleInteractiveEvent(data.event, { trackEvent: track })
             .catch((err) => {
               logger?.error?.("interactive_event_failed", {
@@ -128,7 +128,7 @@ function createSeatalkCallbackRouter(options = {}) {
 
         case NEW_MENTIONED_MESSAGE_RECEIVED_FROM_GROUP_CHAT:
           logger?.info?.("bot_mentioned_in_group", { requestId });
-          groupHandler
+          await groupHandler
             .handleGroupMention(data.event, {
               sheetCache,
               refreshSheetCache,

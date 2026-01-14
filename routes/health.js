@@ -14,9 +14,10 @@ function createHealthRouter(options = {}) {
         ? getMissingRequiredConfig()
         : [];
 
+    const isVercel = Boolean(process.env.VERCEL || process.env.VERCEL_ENV);
     const indexLoaded =
       Array.isArray(indexStore?.items) && indexStore.items.length > 0;
-    if (!indexLoaded) {
+    if (!isVercel && !indexLoaded) {
       missing.push("INDEX_STORE");
     }
 

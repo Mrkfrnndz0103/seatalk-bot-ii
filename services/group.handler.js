@@ -292,6 +292,38 @@ function getPositiveLead() {
   return options[Math.floor(Math.random() * options.length)];
 }
 
+function applyHonorificPrefix(text, event, deps) {
+  if (!text) {
+    return text;
+  }
+  if (typeof deps.getHonorificPrefix !== "function") {
+    return text;
+  }
+  const prefix = deps.getHonorificPrefix(event);
+  if (!prefix) {
+    return text;
+  }
+
+  const trimmed = String(text).trim();
+  if (!trimmed) {
+    return text;
+  }
+
+  const lower = trimmed.toLowerCase();
+  if (
+    lower.startsWith("sir ") ||
+    lower.startsWith("maam ") ||
+    lower.startsWith("hello sir") ||
+    lower.startsWith("hello maam") ||
+    lower.startsWith("hi sir") ||
+    lower.startsWith("hi maam")
+  ) {
+    return text;
+  }
+
+  return `${prefix}, ${trimmed}`;
+}
+
 async function handleGroupMention(event, deps) {
   const groupId = getGroupId(event);
   if (!groupId) {
@@ -332,7 +364,8 @@ async function handleGroupMention(event, deps) {
   ];
   const canned = cannedReplies.find((entry) => entry.match(normalizedText));
   if (canned) {
-    await sendGroupTextMessage(groupId, canned.reply, deps);
+    const reply = applyHonorificPrefix(canned.reply, event, deps);
+    await sendGroupTextMessage(groupId, reply, deps);
     return;
   }
   const sessionKey = deps.sessionStore
@@ -348,17 +381,19 @@ async function handleGroupMention(event, deps) {
   if (isGreetingOnly(msgText)) {
     if (deps.buildGreeting) {
       const greeting = await deps.buildGreeting(event);
-      await sendGroupTextMessage(groupId, greeting, deps);
+      const reply = applyHonorificPrefix(greeting, event, deps);
+      await sendGroupTextMessage(groupId, reply, deps);
     }
     return;
   }
 
   if (isAgeQuestion(msgText)) {
-    await sendGroupTextMessage(
-      groupId,
+    const reply = applyHonorificPrefix(
       "I don't have a real age. I'm a bot here to help you with questions.",
+      event,
       deps
     );
+    await sendGroupTextMessage(groupId, reply, deps);
     return;
   }
 
@@ -376,7 +411,8 @@ async function handleGroupMention(event, deps) {
       requestId: deps.requestId
     });
     if (convoReply) {
-      await sendGroupTextMessage(groupId, convoReply, deps);
+      const reply = applyHonorificPrefix(convoReply, event, deps);
+      await sendGroupTextMessage(groupId, reply, deps);
       return;
     }
   }
@@ -403,7 +439,8 @@ async function handleGroupMention(event, deps) {
   if (wantsHelp && typeof deps.handleCommand === "function") {
     const helpReply = await deps.handleCommand("/help", deps.commandContext || {});
     if (helpReply && helpReply.text) {
-      await sendGroupTextMessage(groupId, helpReply.text, deps);
+      const reply = applyHonorificPrefix(helpReply.text, event, deps);
+      await sendGroupTextMessage(groupId, reply, deps);
       return;
     }
   }
@@ -428,7 +465,8 @@ async function handleGroupMention(event, deps) {
   if (reply && reply.text) {
     const lead = getPositiveLead();
     const content = lead ? `${lead}\n\n${reply.text}` : reply.text;
-    await sendGroupTextMessage(groupId, content, deps);
+    const reply = applyHonorificPrefix(content, event, deps);
+    await sendGroupTextMessage(groupId, reply, deps);
     return;
   }
 
@@ -445,7 +483,8 @@ async function handleGroupMention(event, deps) {
       requestId: deps.requestId
     });
     if (fallbackReply) {
-      await sendGroupTextMessage(groupId, fallbackReply, deps);
+      const reply = applyHonorificPrefix(fallbackReply, event, deps);
+      await sendGroupTextMessage(groupId, reply, deps);
     }
   }
 }

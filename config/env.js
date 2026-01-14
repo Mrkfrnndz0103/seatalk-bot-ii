@@ -38,6 +38,11 @@ const DEFAULT_GOOGLE_OAUTH_TOKEN_FILE = IS_VERCEL
   ? "/tmp/google-token.json"
   : "";
 const DEFAULT_SYNC_MIN_CSV_WARN = 5;
+const DEFAULT_DRIVE_WATCH_STATE_PATH = IS_VERCEL
+  ? "/tmp/drive-watch.json"
+  : "./data/drive-watch.json";
+const DEFAULT_DRIVE_WATCH_TTL_MS = 6 * 24 * 60 * 60 * 1000;
+const DEFAULT_DRIVE_WATCH_RENEW_WINDOW_MS = 12 * 60 * 60 * 1000;
 const DEFAULT_BACKLOGS_DATA_SHEET_ID =
   "1mf7WSmGnzDFt3l5oZqi0UISNxP_i0BGYAW8PM5vwPQ0";
 const DEFAULT_BACKLOGS_DATA_TAB_NAME = "backlogs";
@@ -143,6 +148,7 @@ const env = {
   ),
   BOT_NAME: process.env.BOT_NAME || "SeaTalk Bot",
   GREETING_OVERRIDES_JSON: process.env.GREETING_OVERRIDES_JSON || "",
+  GREETING_OVERRIDES_FILE: process.env.GREETING_OVERRIDES_FILE || "",
   DRIVE_FOLDER_ID: process.env.DRIVE_FOLDER_ID || "",
   SYNC_DRIVE_FOLDER_ID:
     process.env.SYNC_DRIVE_FOLDER_ID || process.env.DRIVE_FOLDER_ID || "",
@@ -153,6 +159,20 @@ const env = {
   SYNC_MIN_CSV_WARN: parseNonNegativeInt(
     process.env.SYNC_MIN_CSV_WARN,
     DEFAULT_SYNC_MIN_CSV_WARN
+  ),
+  DRIVE_WATCH_FILE_ID:
+    process.env.DRIVE_WATCH_FILE_ID || process.env.BACKLOGS_IMAGE_SHEET_ID || "",
+  DRIVE_WATCH_WEBHOOK_URL: process.env.DRIVE_WATCH_WEBHOOK_URL || "",
+  DRIVE_WATCH_TOKEN: process.env.DRIVE_WATCH_TOKEN || "",
+  DRIVE_WATCH_STATE_PATH:
+    process.env.DRIVE_WATCH_STATE_PATH || DEFAULT_DRIVE_WATCH_STATE_PATH,
+  DRIVE_WATCH_TTL_MS: parsePositiveInt(
+    process.env.DRIVE_WATCH_TTL_MS,
+    DEFAULT_DRIVE_WATCH_TTL_MS
+  ),
+  DRIVE_WATCH_RENEW_WINDOW_MS: parsePositiveInt(
+    process.env.DRIVE_WATCH_RENEW_WINDOW_MS,
+    DEFAULT_DRIVE_WATCH_RENEW_WINDOW_MS
   ),
   GOOGLE_PROJECT_ID: process.env.GOOGLE_PROJECT_ID || "",
   GOOGLE_CLIENT_EMAIL: process.env.GOOGLE_CLIENT_EMAIL || "",

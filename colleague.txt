@@ -1,0 +1,55 @@
+Email: romark.fernandez@spxexpress.com
+Name: Mark
+Gender: Male
+
+Email: gregorio.laspenas@spxexpress.com
+Name: Greg
+Gender: Female
+
+Email: christy.baylon@spxexpress.com
+Name: Christy
+Gender: Female
+
+Email: renzo.rocamora@spxexpress.com
+Name: Renzo
+Gender: Male
+
+Email: joan.siapno@spxexpress.com
+Name: Jo
+Gender: Female
+
+Email: ernalie.valencia@spxexpress.com
+Name: Alie
+Gender: Female
+
+Email: marichu.busano@spxexpress.com
+Name: Chu
+Gender: Female
+
+Email: arjay.ramos@spxexpress.com
+Name: Arjay
+Gender: Male
+
+Email: zaldy.milaya@spxexpress.com
+Name: Fafah Zie
+Gender: Male
+
+Email: norsalin.sencil@spxexpress.com
+Name: Sencil
+Gender: Male
+
+Email: merlyn.policarpio@spxexpress.com
+Name: Merlyn
+Gender: Female
+
+Email: maria.pablo@spxexpress.com
+Name: Maria
+Gender: Female
+
+Email: joanna.tayamen@spxexpress.com
+Name: Joanna
+Gender: Female
+
+Email: robert.tan@spxexpress.com
+Name: Robert
+Gender: Male

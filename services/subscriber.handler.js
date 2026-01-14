@@ -15,7 +15,18 @@ function createSubscriberHandler(deps = {}) {
         }
         const lead = options.addLead ? deps.getPositiveLead() : "";
         const content = lead ? `${lead}\n\n${text}` : text;
-        await deps.sendSubscriberMessage(employeeCode, content);
+        const prefix =
+          typeof deps.getHonorificPrefix === "function"
+            ? deps.getHonorificPrefix(event)
+            : "";
+        const trimmed = String(content || "").trim();
+        const shouldPrefix =
+          prefix &&
+          trimmed &&
+          !/^\s*(hello|hi)\s+(sir|maam)\b/i.test(trimmed) &&
+          !/^\s*(sir|maam)\b/i.test(trimmed);
+        const finalContent = shouldPrefix ? `${prefix}, ${trimmed}` : content;
+        await deps.sendSubscriberMessage(employeeCode, finalContent);
       };
 
       if (!employeeCode) {

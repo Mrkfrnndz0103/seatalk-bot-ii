@@ -1,3 +1,5 @@
+const fs = require("fs");
+const path = require("path");
 const { logger: defaultLogger } = require("../../utils/logger");
 
 function createProfileService(options = {}) {
@@ -10,12 +12,19 @@ function createProfileService(options = {}) {
     profileLookupCooldownMs,
     profileCacheMinutes,
     greetingOverridesJson,
+    greetingOverridesFile,
     logger = defaultLogger
   } = options;
 
   const profileCache = new Map();
   let profileLookupDisabledUntilMs = 0;
-  const greetingOverrides = loadGreetingOverrides(greetingOverridesJson, logger);
+  const greetingOverrides = loadGreetingOverrides(
+    {
+      json: greetingOverridesJson,
+      filePath: greetingOverridesFile
+    },
+    logger
+  );
 
   function getSeatalkIdentity(event) {
     const sender = event?.sender || event?.message?.sender || null;
@@ -131,6 +140,33 @@ function createProfileService(options = {}) {
 
     const title = override.gender === "female" ? "Ma'am" : "Sir";
     return `Hello ${title} ${override.name} \u{1F44B}, How can I assist you today?`;
+  }
+
+  function buildHonorificTitle(gender) {
+    if (!gender) {
+      return "";
+    }
+    return normalizeGender(gender) === "female" ? "Maam" : "Sir";
+  }
+
+  function getHonorificPrefix(event) {
+    const identity = getSeatalkIdentity(event);
+    const email = String(identity.email || "").toLowerCase().trim();
+    if (!email) {
+      return "";
+    }
+
+    const override = greetingOverrides.get(email);
+    if (!override) {
+      return "";
+    }
+
+    const title = buildHonorificTitle(override.gender);
+    if (!title) {
+      return "";
+    }
+    const name = String(override.name || "").trim() || formatUserName(event);
+    return name ? `${title} ${name}` : title;
   }
 
   function shouldSkipProfileLookup() {
@@ -414,11 +450,21 @@ function createProfileService(options = {}) {
   return {
     buildGreeting,
     buildGreetingFromName,
-    getSeatalkProfileDetails
+    getSeatalkProfileDetails,
+    getHonorificPrefix
   };
 }
 
-function loadGreetingOverrides(raw, logger) {
+function loadGreetingOverrides({ json, filePath }, logger) {
+  const overrides = new Map();
+  const jsonOverrides = loadGreetingOverridesFromJson(json, logger);
+  jsonOverrides.forEach((value, key) => overrides.set(key, value));
+  const fileOverrides = loadGreetingOverridesFromFile(filePath, logger);
+  fileOverrides.forEach((value, key) => overrides.set(key, value));
+  return overrides;
+}
+
+function loadGreetingOverridesFromJson(raw, logger) {
   const overrides = new Map();
   if (!raw) {
     return overrides;
@@ -444,6 +490,77 @@ function loadGreetingOverrides(raw, logger) {
     logger.warn("greeting_overrides_invalid", { error: error.message });
   }
 
+  return overrides;
+}
+
+function loadGreetingOverridesFromFile(filePath, logger) {
+  const overrides = new Map();
+  if (!filePath) {
+    return overrides;
+  }
+
+  const resolved = path.resolve(filePath);
+  if (!fs.existsSync(resolved)) {
+    logger.warn("greeting_overrides_file_missing", { path: resolved });
+    return overrides;
+  }
+
+  let raw = "";
+  try {
+    raw = fs.readFileSync(resolved, "utf8");
+  } catch (error) {
+    logger.warn("greeting_overrides_file_read_failed", {
+      path: resolved,
+      error: error.message
+    });
+    return overrides;
+  }
+
+  let current = {};
+  function commit() {
+    if (!current.email) {
+      return;
+    }
+    const normalizedEmail = String(current.email).toLowerCase().trim();
+    if (!normalizedEmail) {
+      return;
+    }
+    overrides.set(normalizedEmail, {
+      name: current.name || "",
+      gender: normalizeGender(current.gender),
+      omitTimeGreeting: false
+    });
+  }
+
+  raw.split(/\r?\n/).forEach((line) => {
+    const trimmed = String(line || "").trim();
+    if (!trimmed) {
+      commit();
+      current = {};
+      return;
+    }
+
+    const match = trimmed.match(/^([A-Za-z\s]+)\s*:\s*(.+)$/);
+    if (!match) {
+      return;
+    }
+
+    const key = match[1].trim().toLowerCase();
+    const value = match[2].trim();
+    if (!value) {
+      return;
+    }
+
+    if (key === "email") {
+      current.email = value;
+    } else if (key === "name") {
+      current.name = value;
+    } else if (key === "gender") {
+      current.gender = value;
+    }
+  });
+
+  commit();
   return overrides;
 }
 

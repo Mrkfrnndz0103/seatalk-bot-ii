@@ -21,6 +21,7 @@ const { createSeatalkMessaging } = require("../src/seatalk/messaging");
 const { createProfileService } = require("../src/profile/profile.service");
 const { createSubscriberHandler } = require("../services/subscriber.handler");
 const { createBacklogsPublisher } = require("../src/backlogs/publisher");
+const { createDriveWatch } = require("../services/drive.watch");
 const { createGoogleAuth } = require("../src/sheets/google.auth");
 const { createSheetsService } = require("../src/sheets/sheets.service");
 const { createApp } = require("./app");
@@ -348,9 +349,10 @@ function createServerApp(options = {}) {
     profileLookupCooldownMs: SEATALK_PROFILE_LOOKUP_COOLDOWN_MS,
     profileCacheMinutes: SEATALK_PROFILE_CACHE_MINUTES,
     greetingOverridesJson: env.GREETING_OVERRIDES_JSON,
+    greetingOverridesFile: env.GREETING_OVERRIDES_FILE,
     logger
   });
-  const { buildGreeting } = profileService;
+  const { buildGreeting, getHonorificPrefix } = profileService;
 
   const googleAuth = createGoogleAuth({
     oauthClientId: env.GOOGLE_OAUTH_CLIENT_ID,
@@ -412,6 +414,17 @@ function createServerApp(options = {}) {
     logger
   });
   const { sendBacklogsScheduledUpdate } = backlogsPublisher;
+
+  const driveWatch = createDriveWatch({
+    getDriveApi: googleAuth.getDriveApi,
+    fileId: env.DRIVE_WATCH_FILE_ID,
+    address: env.DRIVE_WATCH_WEBHOOK_URL,
+    token: env.DRIVE_WATCH_TOKEN,
+    statePath: env.DRIVE_WATCH_STATE_PATH,
+    ttlMs: env.DRIVE_WATCH_TTL_MS,
+    renewWindowMs: env.DRIVE_WATCH_RENEW_WINDOW_MS,
+    logger
+  });
 
   function trackSystemEvent(type, details) {
     trackEvent({
@@ -475,12 +488,14 @@ function createServerApp(options = {}) {
     indexStore,
     knownCommands: KNOWN_COMMANDS,
     buildGreeting,
+    getHonorificPrefix,
     getEventMessageText,
     sendSubscriberMessage,
     sendSubscriberTyping
   });
 
   async function runScheduledTasks() {
+    await driveWatch.ensureWatch();
     await runDriveZipSync();
     await sendBacklogsScheduledUpdate();
   }
@@ -531,6 +546,7 @@ function createServerApp(options = {}) {
       knownCommands: KNOWN_COMMANDS,
       detectIntent: intentService.detectIntent,
       buildGreeting,
+      getHonorificPrefix,
       generateIntelligentReply,
       readSheetRange: sheetsService.readSheetRange,
       sendGroupMessage,
@@ -539,10 +555,20 @@ function createServerApp(options = {}) {
       apiBaseUrl: SEATALK_API_BASE_URL,
       indexStore,
       groupSessionStore
+    },
+    driveWatch: {
+      logger,
+      driveWatch,
+      onDriveChange: async () => {
+        await sendBacklogsScheduledUpdate();
+      }
     }
   });
 
   validateStartupConfig({ exitOnFailure: exitOnInvalidConfig });
+  driveWatch.ensureWatch().catch((error) => {
+    logger.warn("drive_watch_init_failed", { error: error.message });
+  });
   if (enableSheetRefreshTimer) {
     sheetsService.startSheetRefreshTimer();
   }

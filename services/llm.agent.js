@@ -1,5 +1,9 @@
 const axios = require("axios");
 const {
+  extractResponseText,
+  sendOpenRouterResponse
+} = require("./openrouter.client");
+const {
   shouldPrefetchChatHistory,
   shouldUseEmployeeLookup
 } = require("./llm.tool.policy");
@@ -47,6 +51,62 @@ function parseToolArguments(args) {
   return args;
 }
 
+function normalizeResponseTools(definitions) {
+  if (!Array.isArray(definitions)) {
+    return [];
+  }
+
+  return definitions
+    .map((tool) => {
+      if (!tool) {
+        return null;
+      }
+      if (tool.type === "function" && tool.function) {
+        return {
+          type: "function",
+          name: tool.function.name,
+          description: tool.function.description,
+          parameters: tool.function.parameters || null,
+          strict: true
+        };
+      }
+      if (tool.type === "function" && tool.name) {
+        return {
+          type: "function",
+          name: tool.name,
+          description: tool.description,
+          parameters: tool.parameters || null,
+          strict: true
+        };
+      }
+      return tool;
+    })
+    .filter(Boolean);
+}
+
+function buildResponseInput(messages) {
+  return messages.map((message) => ({
+    type: "message",
+    role: message.role,
+    content: message.content
+  }));
+}
+
+function extractResponseToolCalls(outputItems) {
+  if (!Array.isArray(outputItems)) {
+    return [];
+  }
+  return outputItems.filter((item) => item?.type === "function_call");
+}
+
+function buildFunctionCallOutputItem(callId, output) {
+  return {
+    type: "function_call_output",
+    call_id: callId,
+    output: typeof output === "string" ? output : JSON.stringify(output)
+  };
+}
+
 function buildSystemPrompt(options) {
   const botName = options.botName || "SeaTalk Bot";
   if (options.conversation) {
@@ -58,6 +118,69 @@ function buildSystemPrompt(options) {
     "If the request is about backlogs, top contributors by region, or truck requests, answer using the provided sheet context. " +
     "If it is unclear or does not match, ask one brief clarifying question and give one example query."
   );
+}
+
+function normalizeEmployeeFromResult(toolName, result) {
+  if (!result || typeof result !== "object") {
+    return null;
+  }
+
+  if (toolName === "get_employee_profile") {
+    const employee = result.employee || result.profile || result.data?.employee;
+    if (!employee || typeof employee !== "object") {
+      return null;
+    }
+    return {
+      employee_code: employee.employee_code || employee.employeeCode,
+      name: employee.name,
+      email: employee.company_email || employee.email
+    };
+  }
+
+  if (toolName === "get_employee_code_with_email") {
+    const entries = Array.isArray(result.employees)
+      ? result.employees
+      : result.results;
+    if (!Array.isArray(entries) || !entries.length) {
+      return null;
+    }
+    const candidate =
+      entries.find((entry) => entry?.employee_code || entry?.employeeCode) ||
+      entries[0];
+    if (!candidate || typeof candidate !== "object") {
+      return null;
+    }
+    return {
+      employee_code: candidate.employee_code || candidate.employeeCode,
+      email: candidate.email || candidate.company_email,
+      employee_status: candidate.employee_status ?? candidate.status,
+      exists: candidate.exists
+    };
+  }
+
+  return null;
+}
+
+function updateSessionFromToolResult(replyOptions, toolName, result) {
+  const store = replyOptions?.sessionStore;
+  const key = replyOptions?.sessionKey;
+  if (!store || !key) {
+    return;
+  }
+
+  const employee = normalizeEmployeeFromResult(toolName, result);
+  if (!employee) {
+    return;
+  }
+
+  const update = {
+    lastEmployee: employee,
+    lastEmployeeUpdatedAt: new Date().toISOString()
+  };
+  if (employee.email) {
+    update.lastMentionedEmail = employee.email;
+  }
+  store.update(key, update);
 }
 
 function sanitizeToolArgs(args) {
@@ -113,70 +236,164 @@ function createLlmAgent(options) {
   const toolHandlers = options.toolHandlers || {};
   const logger = options.logger || null;
 
-  async function generateReply(message, replyOptions = {}) {
-    if (!config.apiKey || !config.model) {
-      return "Thanks for your message.";
+  async function buildMessages(message, replyOptions, allowTools) {
+    const systemPrompt = buildSystemPrompt({
+      botName: config.botName,
+      conversation: replyOptions.conversation
+    });
+
+    const messages = [{ role: "system", content: systemPrompt }];
+    if (allowTools) {
+      const toolNote = shouldUseEmployeeLookup(message)
+        ? "Use employee lookup tools if needed. Use send_message tools only when the user explicitly asks to send a message."
+        : "Use SeaTalk tools if needed. Use send_message tools only when the user explicitly asks to send a message.";
+      messages.push({
+        role: "system",
+        content: toolNote
+      });
     }
 
-    try {
-      const systemPrompt = buildSystemPrompt({
-        botName: config.botName,
-        conversation: replyOptions.conversation
+    if (replyOptions.extraSystemContext) {
+      messages.push({
+        role: "system",
+        content: replyOptions.extraSystemContext
       });
+    }
 
-      const messages = [{ role: "system", content: systemPrompt }];
-      const allowTools =
-        replyOptions.useTools !== false && toolDefinitions.length > 0;
-      if (allowTools) {
-        const toolNote = shouldUseEmployeeLookup(message)
-          ? "Use employee lookup tools if needed. Use send_message tools only when the user explicitly asks to send a message."
-          : "Use SeaTalk tools if needed. Use send_message tools only when the user explicitly asks to send a message.";
-        messages.push({
-          role: "system",
-          content: toolNote
+    if (replyOptions.sheetContext) {
+      messages.push({
+        role: "system",
+        content: `Context from team sheets (partial, may be outdated):\n${replyOptions.sheetContext}`
+      });
+    }
+
+    if (
+      replyOptions.prefetchChatHistory &&
+      replyOptions.groupId &&
+      toolHandlers.get_chat_history &&
+      shouldPrefetchChatHistory(message)
+    ) {
+      try {
+        const history = await toolHandlers.get_chat_history({
+          group_id: replyOptions.groupId,
+          page_size: 5
         });
-      }
-
-      if (replyOptions.extraSystemContext) {
-        messages.push({
-          role: "system",
-          content: replyOptions.extraSystemContext
-        });
-      }
-
-      if (replyOptions.sheetContext) {
-        messages.push({
-          role: "system",
-          content: `Context from team sheets (partial, may be outdated):\n${replyOptions.sheetContext}`
-        });
-      }
-
-      if (
-        replyOptions.prefetchChatHistory &&
-        replyOptions.groupId &&
-        toolHandlers.get_chat_history &&
-        shouldPrefetchChatHistory(message)
-      ) {
-        try {
-          const history = await toolHandlers.get_chat_history({
-            group_id: replyOptions.groupId,
-            page_size: 5
+        if (history && history.messages) {
+          messages.push({
+            role: "system",
+            content: `Recent chat history (last 5):\n${JSON.stringify(history.messages)}`
           });
-          if (history && history.messages) {
-            messages.push({
-              role: "system",
-              content: `Recent chat history (last 5):\n${JSON.stringify(history.messages)}`
-            });
-          }
+        }
+      } catch (error) {
+        if (logger && logger.warn) {
+          logger.warn("mcp_prefetch_failed", { reason: error.message });
+        }
+      }
+    }
+
+    messages.push({ role: "user", content: message });
+    return messages;
+  }
+
+  async function generateReplyWithResponses(messages, allowTools, replyOptions) {
+    const input = buildResponseInput(messages);
+    const responseTools = allowTools
+      ? normalizeResponseTools(toolDefinitions)
+      : [];
+    let rounds = 0;
+    let response;
+    let useTools = allowTools;
+
+    try {
+      response = await sendOpenRouterResponse(config, {
+        model: config.model,
+        input,
+        tools: useTools ? responseTools : undefined,
+        tool_choice: useTools ? "auto" : undefined,
+        temperature: 0.3,
+        max_output_tokens: 220
+      });
+    } catch (error) {
+      if (useTools && isToolUseNotSupportedError(error)) {
+        useTools = false;
+        response = await sendOpenRouterResponse(config, {
+          model: config.model,
+          input,
+          temperature: 0.3,
+          max_output_tokens: 220
+        });
+      } else {
+        throw error;
+      }
+    }
+
+    while (rounds < DEFAULT_MAX_TOOL_ROUNDS) {
+      const outputItems = Array.isArray(response?.output) ? response.output : [];
+      const toolCalls = extractResponseToolCalls(outputItems);
+      if (!toolCalls.length) {
+        return extractResponseText(response);
+      }
+      if (!useTools) {
+        return extractResponseText(response);
+      }
+
+      input.push(...outputItems);
+
+      for (const toolCall of toolCalls) {
+        const name = toolCall?.name;
+        const callId = toolCall?.call_id || toolCall?.id || "tool";
+        const args = parseToolArguments(toolCall?.arguments);
+        if (!name || typeof toolHandlers[name] !== "function") {
+          input.push(
+            buildFunctionCallOutputItem(callId, {
+              error: `Unknown tool: ${name}`
+            })
+          );
+          continue;
+        }
+
+        if (logger && logger.info) {
+          logger.info("llm_tool_call", {
+            tool: name,
+            args: sanitizeToolArgs(args)
+          });
+        }
+
+        try {
+          const result = await toolHandlers[name](args, replyOptions);
+          updateSessionFromToolResult(replyOptions, name, result);
+          input.push(buildFunctionCallOutputItem(callId, result));
         } catch (error) {
-          if (logger && logger.warn) {
-            logger.warn("mcp_prefetch_failed", { reason: error.message });
-          }
+          const message =
+            error.userMessage || error.message || "Tool call failed";
+          input.push(
+            buildFunctionCallOutputItem(callId, {
+              error: message
+            })
+          );
         }
       }
 
-      messages.push({ role: "user", content: message });
+      rounds += 1;
+      response = await sendOpenRouterResponse(config, {
+        model: config.model,
+        input,
+        tools: useTools ? responseTools : undefined,
+        tool_choice: useTools ? "auto" : undefined,
+        temperature: 0.3,
+        max_output_tokens: 220
+      });
+    }
 
+    return extractResponseText(response);
+  }
+
+  async function generateReplyWithChatCompletions(
+    messages,
+    allowTools,
+    replyOptions
+  ) {
+    try {
       let rounds = 0;
       let response;
       let useTools = allowTools;
@@ -235,10 +452,11 @@ function createLlmAgent(options) {
           }
 
           try {
-            const result = await toolHandlers[name](args);
-            messages.push(buildToolMessage(toolCall.id || "tool", result));
-          } catch (error) {
-            const message =
+          const result = await toolHandlers[name](args, replyOptions);
+          updateSessionFromToolResult(replyOptions, name, result);
+          messages.push(buildToolMessage(toolCall.id || "tool", result));
+        } catch (error) {
+          const message =
               error.userMessage || error.message || "Tool call failed";
             messages.push(
               buildToolMessage(toolCall.id || "tool", {
@@ -269,6 +487,41 @@ function createLlmAgent(options) {
       }
       return "Thanks for your message.";
     }
+  }
+
+  async function generateReply(message, replyOptions = {}) {
+    if (!config.apiKey || !config.model) {
+      if (logger && logger.warn) {
+        logger.warn("openrouter_not_configured", {
+          hasKey: Boolean(config.apiKey),
+          hasModel: Boolean(config.model)
+        });
+      }
+      return "Thanks for your message.";
+    }
+
+    const allowTools =
+      replyOptions.useTools !== false && toolDefinitions.length > 0;
+    const messages = await buildMessages(message, replyOptions, allowTools);
+
+    try {
+      const reply = await generateReplyWithResponses(
+        messages,
+        allowTools,
+        replyOptions
+      );
+      if (reply) {
+        return reply;
+      }
+    } catch (error) {
+      if (logger && logger.warn) {
+        logger.warn("llm_responses_failed", {
+          error: error.response?.data || error.message
+        });
+      }
+    }
+
+    return generateReplyWithChatCompletions(messages, allowTools, replyOptions);
   }
 
   return {

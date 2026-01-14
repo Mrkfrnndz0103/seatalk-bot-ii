@@ -23,6 +23,13 @@ function getThreadId(event) {
   return null;
 }
 
+function buildSessionKey(groupId, threadId) {
+  if (!groupId) {
+    return null;
+  }
+  return threadId ? `${groupId}:${threadId}` : groupId;
+}
+
 function getMessageText(event) {
   if (typeof event?.message?.text === "string") {
     return event.message.text;
@@ -36,6 +43,103 @@ function getMessageText(event) {
     event?.text ||
     ""
   );
+}
+
+function extractEmails(text) {
+  const matches = String(text || "").match(
+    /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi
+  );
+  if (!matches) {
+    return [];
+  }
+  const unique = new Set(matches.map((value) => value.toLowerCase()));
+  return Array.from(unique);
+}
+
+function detectPendingIntent(text) {
+  const normalized = String(text || "").toLowerCase();
+  if (!normalized) {
+    return null;
+  }
+  if (
+    normalized.includes("greet") ||
+    normalized.includes("say hi") ||
+    normalized.includes("say hello")
+  ) {
+    return "greet";
+  }
+  if (normalized.includes("congratulat")) {
+    return "congratulate";
+  }
+  return null;
+}
+
+function buildSessionContext(session) {
+  if (!session || typeof session !== "object") {
+    return "";
+  }
+
+  const lines = [];
+  if (session.pendingIntent) {
+    lines.push(`Pending request: ${session.pendingIntent}.`);
+  }
+
+  const employee = session.lastEmployee;
+  if (employee && typeof employee === "object") {
+    const details = [];
+    if (employee.name) {
+      details.push(`name=${employee.name}`);
+    }
+    if (employee.employee_code) {
+      details.push(`employee_code=${employee.employee_code}`);
+    }
+    if (employee.email) {
+      details.push(`email=${employee.email}`);
+    }
+    if (employee.employee_status !== undefined) {
+      details.push(`status=${employee.employee_status}`);
+    }
+    if (details.length) {
+      lines.push(`Last referenced employee: ${details.join(", ")}.`);
+    }
+  }
+
+  if (
+    session.lastMentionedEmail &&
+    session.lastMentionedEmail !== employee?.email
+  ) {
+    lines.push(`Last provided email: ${session.lastMentionedEmail}.`);
+  }
+
+  if (!lines.length) {
+    return "";
+  }
+
+  return `Session memory (may be stale): ${lines.join(" ")}`;
+}
+
+function updateSessionFromMessage(sessionStore, sessionKey, msgText) {
+  if (!sessionStore || !sessionKey) {
+    return null;
+  }
+
+  const update = {
+    lastUserMessage: msgText,
+    lastUserMessageAt: new Date().toISOString()
+  };
+
+  const emails = extractEmails(msgText);
+  if (emails.length) {
+    update.lastMentionedEmail = emails[0];
+    update.lastMentionedEmails = emails;
+  }
+
+  const pendingIntent = detectPendingIntent(msgText);
+  if (pendingIntent) {
+    update.pendingIntent = pendingIntent;
+  }
+
+  return sessionStore.update(sessionKey, update);
 }
 
 function escapeRegExp(value) {
@@ -206,6 +310,15 @@ async function handleGroupMention(event, deps) {
 
   const rawText = getMessageText(event);
   const msgText = stripMentionedUsers(rawText, event, deps);
+  const sessionKey = deps.sessionStore
+    ? buildSessionKey(groupId, threadId)
+    : null;
+  if (sessionKey) {
+    updateSessionFromMessage(deps.sessionStore, sessionKey, msgText);
+  }
+  const sessionContext = sessionKey
+    ? buildSessionContext(deps.sessionStore.get(sessionKey))
+    : "";
 
   if (isGreetingOnly(msgText)) {
     if (deps.buildGreeting) {
@@ -231,6 +344,9 @@ async function handleGroupMention(event, deps) {
       useTools: false,
       prefetchChatHistory: true,
       groupId,
+      sessionContext,
+      sessionStore: deps.sessionStore,
+      sessionKey,
       logger: deps.logger,
       requestId: deps.requestId
     });
@@ -293,10 +409,13 @@ async function handleGroupMention(event, deps) {
 
   if (typeof deps.generateReply === "function") {
     const fallbackReply = await deps.generateReply(msgText, {
-      skipSheetContext: false,
-      conversation: false,
+      skipSheetContext: true,
+      conversation: true,
       prefetchChatHistory: true,
       groupId,
+      sessionContext,
+      sessionStore: deps.sessionStore,
+      sessionKey,
       logger: deps.logger,
       requestId: deps.requestId
     });
@@ -309,4 +428,3 @@ async function handleGroupMention(event, deps) {
 module.exports = {
   handleGroupMention
 };
-

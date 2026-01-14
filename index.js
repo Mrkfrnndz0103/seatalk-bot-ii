@@ -5,10 +5,17 @@ const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
 const { google } = require("googleapis");
+
 require("dotenv").config();
+console.log("ENV CHECK", {
+  hasKey: Boolean(process.env.OPENROUTER_API_KEY),
+  model: process.env.OPENROUTER_MODEL
+});
+
 
 const env = require("./config/env");
 const { FileStore } = require("./store/file.store");
+const { SessionStore } = require("./store/session.store");
 const commands = require("./commands");
 const intentService = require("./services/intent.service");
 const groupHandler = require("./services/group.handler");
@@ -101,6 +108,7 @@ app.use(rateLimit);
 
 const indexStore = new FileStore({ path: env.INDEX_STORE_PATH });
 indexStore.load();
+const groupSessionStore = new SessionStore();
 
 // ======================
 // Your bot settings
@@ -163,6 +171,8 @@ const BACKLOGS_IMAGE_SHEET_ID = env.BACKLOGS_IMAGE_SHEET_ID;
 const BACKLOGS_IMAGE_TAB_NAME = env.BACKLOGS_IMAGE_TAB_NAME;
 const BACKLOGS_IMAGE_GID = env.BACKLOGS_IMAGE_GID;
 const BACKLOGS_IMAGE_RANGE = env.BACKLOGS_IMAGE_RANGE;
+const BACKLOGS_MONITOR_RANGE = env.BACKLOGS_MONITOR_RANGE;
+const BACKLOGS_MONITOR_STATE_PATH = env.BACKLOGS_MONITOR_STATE_PATH;
 const BACKLOGS_TIMEZONE = env.BACKLOGS_TIMEZONE;
 
 const seatalkMcpClient = new SeatalkMcpClient({
@@ -625,7 +635,17 @@ function isConversational(text) {
     "do you want",
     "can you",
     "are you",
-    "tell me about yourself"
+    "tell me about yourself",
+    "say hi",
+    "say hello",
+    "say hey",
+    "say hey there",
+    "say hey there!",
+    "greet",
+    "tell",
+    "tell me",
+    "tell me a story",
+    "tell me a joke"
   ];
 
   return phrases.some((phrase) => normalized.includes(phrase));
@@ -1409,6 +1429,101 @@ async function fetchSheetPngBase64(spreadsheetId, tabName, range) {
   return null;
 }
 
+const backlogsMonitorStatePath = path.resolve(
+  BACKLOGS_MONITOR_STATE_PATH || "./data/backlogs-monitor.json"
+);
+
+function loadBacklogsMonitorState() {
+  try {
+    const dir = path.dirname(backlogsMonitorStatePath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    if (!fs.existsSync(backlogsMonitorStatePath)) {
+      return {};
+    }
+    const raw = fs.readFileSync(backlogsMonitorStatePath, "utf8");
+    if (!raw.trim()) {
+      return {};
+    }
+    return JSON.parse(raw);
+  } catch (error) {
+    if (logger && logger.warn) {
+      logger.warn("backlogs_monitor_state_load_failed", {
+        error: error.message
+      });
+    }
+    return {};
+  }
+}
+
+function saveBacklogsMonitorState(state) {
+  try {
+    const dir = path.dirname(backlogsMonitorStatePath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    fs.writeFileSync(backlogsMonitorStatePath, JSON.stringify(state, null, 2));
+  } catch (error) {
+    if (logger && logger.warn) {
+      logger.warn("backlogs_monitor_state_save_failed", {
+        error: error.message
+      });
+    }
+  }
+}
+
+function updateBacklogsMonitorState(patch) {
+  backlogsMonitorState = {
+    ...(backlogsMonitorState || {}),
+    ...(patch || {})
+  };
+  saveBacklogsMonitorState(backlogsMonitorState);
+  return backlogsMonitorState;
+}
+
+function buildBacklogsMonitorRange(tabName, range) {
+  const trimmed = String(range || "").trim();
+  if (!trimmed) {
+    return "";
+  }
+  if (trimmed.includes("!")) {
+    return trimmed;
+  }
+  if (tabName) {
+    return `${tabName}!${trimmed}`;
+  }
+  return trimmed;
+}
+
+function computeRangeSignature(values) {
+  const payload = JSON.stringify(values || []);
+  return crypto.createHash("sha256").update(payload).digest("hex");
+}
+
+async function fetchBacklogsMonitorSignature() {
+  if (!BACKLOGS_IMAGE_SHEET_ID) {
+    return null;
+  }
+  const monitorRange = buildBacklogsMonitorRange(
+    BACKLOGS_IMAGE_TAB_NAME,
+    BACKLOGS_MONITOR_RANGE || BACKLOGS_IMAGE_RANGE
+  );
+  if (!monitorRange) {
+    if (logger && logger.warn) {
+      logger.warn("backlogs_monitor_missing_range");
+    }
+    return null;
+  }
+  const values = await readSheetRange(BACKLOGS_IMAGE_SHEET_ID, monitorRange);
+  if (values === null) {
+    return null;
+  }
+  return computeRangeSignature(values);
+}
+
+let backlogsMonitorState = loadBacklogsMonitorState();
+
 function formatBacklogsTimestamp(date = new Date()) {
   const timeZone = BACKLOGS_TIMEZONE || "UTC";
   try {
@@ -1442,7 +1557,7 @@ function formatBacklogsTimestamp(date = new Date()) {
 
 function buildBacklogsScheduledText(date = new Date()) {
   const timestamp = formatBacklogsTimestamp(date);
-  return `@all Sharing OB Pending for Dispatch as of ${timestamp}`;
+  return `@all Sharing Outbound Pending for Dispatch as of ${timestamp}`;
 }
 
 let backlogsUpdateInFlight = false;
@@ -1459,48 +1574,78 @@ async function sendBacklogsScheduledUpdate() {
     return;
   }
 
-    backlogsUpdateInFlight = true;
-    try {
-      const messageText = buildBacklogsScheduledText(new Date());
-      if (!messageText) {
-        logger.warn("backlogs_schedule_missing_text");
-        return;
-      }
+  backlogsUpdateInFlight = true;
+  try {
+    const nowIso = new Date().toISOString();
+    const signature = await fetchBacklogsMonitorSignature();
+    if (!signature) {
+      updateBacklogsMonitorState({ lastCheckedAt: nowIso });
+      logger.warn("backlogs_monitor_signature_failed");
+      return;
+    }
 
-      const imageBase64 = await fetchSheetPngBase64(
-        BACKLOGS_IMAGE_SHEET_ID,
-        BACKLOGS_IMAGE_TAB_NAME,
-        BACKLOGS_IMAGE_RANGE
-      );
-      if (!imageBase64) {
-        logger.warn("backlogs_schedule_missing_image");
-        return;
-      }
-
-      const imageSent = await sendGroupMessage(BACKLOGS_SCHEDULED_GROUP_ID, {
-        tag: "image",
-        image: {
-          content: imageBase64
-        }
+    if (!backlogsMonitorState?.lastSignature) {
+      updateBacklogsMonitorState({
+        lastSignature: signature,
+        lastCheckedAt: nowIso,
+        baselineAt: nowIso
       });
-      if (!imageSent) {
-        logger.warn("backlogs_schedule_image_send_failed");
-        return;
-      }
+      logger.info("backlogs_monitor_baseline_set");
+      return;
+    }
 
-      const textSent = await sendGroupMessage(
-        BACKLOGS_SCHEDULED_GROUP_ID,
-        messageText
-      );
-      if (!textSent) {
-        logger.warn("backlogs_schedule_text_send_failed");
-        return;
+    if (backlogsMonitorState.lastSignature === signature) {
+      updateBacklogsMonitorState({ lastCheckedAt: nowIso });
+      logger.info("backlogs_monitor_no_change");
+      return;
+    }
+
+    const messageText = buildBacklogsScheduledText(new Date());
+    if (!messageText) {
+      logger.warn("backlogs_schedule_missing_text");
+      return;
+    }
+
+    const imageBase64 = await fetchSheetPngBase64(
+      BACKLOGS_IMAGE_SHEET_ID,
+      BACKLOGS_IMAGE_TAB_NAME,
+      BACKLOGS_IMAGE_RANGE
+    );
+    if (!imageBase64) {
+      logger.warn("backlogs_schedule_missing_image");
+      return;
+    }
+
+    const imageSent = await sendGroupMessage(BACKLOGS_SCHEDULED_GROUP_ID, {
+      tag: "image",
+      image: {
+        content: imageBase64
       }
-      trackSystemEvent(BotEventType.BACKLOGS_SCHEDULED, {
-        groupId: BACKLOGS_SCHEDULED_GROUP_ID
-      });
-      logger.info("backlogs_schedule_sent", {
-        groupId: BACKLOGS_SCHEDULED_GROUP_ID,
+    });
+    if (!imageSent) {
+      logger.warn("backlogs_schedule_image_send_failed");
+      return;
+    }
+
+    const textSent = await sendGroupMessage(
+      BACKLOGS_SCHEDULED_GROUP_ID,
+      messageText
+    );
+    if (!textSent) {
+      logger.warn("backlogs_schedule_text_send_failed");
+      return;
+    }
+    updateBacklogsMonitorState({
+      lastSignature: signature,
+      lastCheckedAt: nowIso,
+      lastSentAt: nowIso,
+      lastChangeAt: nowIso
+    });
+    trackSystemEvent(BotEventType.BACKLOGS_SCHEDULED, {
+      groupId: BACKLOGS_SCHEDULED_GROUP_ID
+    });
+    logger.info("backlogs_schedule_sent", {
+      groupId: BACKLOGS_SCHEDULED_GROUP_ID,
       hasImage: Boolean(imageBase64)
     });
   } catch (error) {
@@ -1893,13 +2038,21 @@ async function generateIntelligentReply(userMessage, options = {}) {
     extraSystemContext = `Use data from the "${label}" tab only.`;
   }
 
+  if (options.sessionContext) {
+    extraSystemContext = extraSystemContext
+      ? `${extraSystemContext}\n${options.sessionContext}`
+      : options.sessionContext;
+  }
+
   return llmAgent.generateReply(userMessage, {
     conversation: options.conversation,
     sheetContext,
     extraSystemContext,
     prefetchChatHistory: options.prefetchChatHistory,
     groupId: options.groupId,
-    useTools: options.useTools
+    useTools: options.useTools,
+    sessionStore: options.sessionStore,
+    sessionKey: options.sessionKey
   });
 }
 
@@ -2546,7 +2699,8 @@ app.post("/seatalk/callback", (req, res) => {
             sendGroupMessage,
             sendGroupTyping,
             postWithAuth,
-            apiBaseUrl: SEATALK_API_BASE_URL
+            apiBaseUrl: SEATALK_API_BASE_URL,
+            sessionStore: groupSessionStore
           })
           .catch((err) => {
             logger.error("group_mention_failed", {

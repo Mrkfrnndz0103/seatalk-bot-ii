@@ -1,4 +1,8 @@
 const axios = require("axios");
+const {
+  extractResponseText,
+  sendOpenRouterResponse
+} = require("../services/openrouter.client");
 const env = require("../config/env");
 
 const DEFAULT_MAX_SNIPPET_CHARS = 800;
@@ -48,6 +52,41 @@ async function summarizeWithOpenRouter(question, chunks, sourcesList, options = 
     "If the answer is not in the sources, say you do not know. " +
     "Include citations in the form [1], [2] that match the Sources list.";
   const context = buildContext(chunks, sourcesList);
+
+  try {
+    const response = await sendOpenRouterResponse(
+      {
+        apiKey: env.OPENROUTER_API_KEY,
+        baseUrl,
+        appUrl,
+        appTitle,
+        timeoutMs: options.timeoutMs || env.OPENROUTER_HTTP_TIMEOUT_MS
+      },
+      {
+        model,
+        input: [
+          { type: "message", role: "system", content: systemPrompt },
+          {
+            type: "message",
+            role: "user",
+            content: `Question: ${question}\n\n${context}`
+          }
+        ],
+        temperature: 0.2,
+        max_output_tokens: 220
+      }
+    );
+
+    const reply = extractResponseText(response);
+    if (reply) {
+      return reply;
+    }
+  } catch (error) {
+    console.error(
+      "OpenRouter SDK summary failed:",
+      error.response?.data || error.message
+    );
+  }
 
   try {
     const response = await axios.post(

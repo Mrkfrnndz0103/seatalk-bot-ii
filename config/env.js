@@ -25,6 +25,9 @@ const DEFAULT_BACKLOGS_IMAGE_RANGE = "B2:R63";
 const DEFAULT_BACKLOGS_MONITOR_RANGE = DEFAULT_BACKLOGS_IMAGE_RANGE;
 const DEFAULT_BACKLOGS_MONITOR_STATE_PATH = "./data/backlogs-monitor.json";
 const DEFAULT_BACKLOGS_TIMEZONE = "Asia/Manila";
+const DEFAULT_SYNC_START_CELL = "A2";
+const DEFAULT_SYNC_STATE_PATH = "./data/drive-sync-state.json";
+const DEFAULT_SYNC_MIN_CSV_WARN = 5;
 
 function parseNonNegativeInt(value, fallback) {
   if (value === undefined || value === null || value === "") {
@@ -126,6 +129,16 @@ const env = {
   ),
   BOT_NAME: process.env.BOT_NAME || "SeaTalk Bot",
   DRIVE_FOLDER_ID: process.env.DRIVE_FOLDER_ID || "",
+  SYNC_DRIVE_FOLDER_ID:
+    process.env.SYNC_DRIVE_FOLDER_ID || process.env.DRIVE_FOLDER_ID || "",
+  SYNC_SHEET_ID: process.env.SYNC_SHEET_ID || "",
+  SYNC_SHEET_TAB_NAME: process.env.SYNC_SHEET_TAB_NAME || "",
+  SYNC_START_CELL: process.env.SYNC_START_CELL || DEFAULT_SYNC_START_CELL,
+  SYNC_STATE_PATH: process.env.SYNC_STATE_PATH || DEFAULT_SYNC_STATE_PATH,
+  SYNC_MIN_CSV_WARN: parseNonNegativeInt(
+    process.env.SYNC_MIN_CSV_WARN,
+    DEFAULT_SYNC_MIN_CSV_WARN
+  ),
   GOOGLE_PROJECT_ID: process.env.GOOGLE_PROJECT_ID || "",
   GOOGLE_CLIENT_EMAIL: process.env.GOOGLE_CLIENT_EMAIL || "",
   GOOGLE_PRIVATE_KEY: process.env.GOOGLE_PRIVATE_KEY
@@ -137,7 +150,7 @@ const env = {
   GOOGLE_OAUTH_TOKEN_FILE: process.env.GOOGLE_OAUTH_TOKEN_FILE || "",
   GOOGLE_SERVICE_ACCOUNT_FILE: process.env.GOOGLE_SERVICE_ACCOUNT_FILE || "",
   GOOGLE_SHEETS_SCOPES: (process.env.GOOGLE_SHEETS_SCOPES ||
-    "https://www.googleapis.com/auth/spreadsheets.readonly")
+    "https://www.googleapis.com/auth/spreadsheets,https://www.googleapis.com/auth/drive.readonly")
     .split(",")
     .map((scope) => scope.trim())
     .filter(Boolean),

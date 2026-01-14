@@ -275,6 +275,15 @@ function createServerApp(options = {}) {
   const SYNC_START_CELL = env.SYNC_START_CELL;
   const SYNC_STATE_PATH = env.SYNC_STATE_PATH;
   const SYNC_MIN_CSV_WARN = env.SYNC_MIN_CSV_WARN;
+  const serviceAccountCredentials =
+    env.GOOGLE_CLIENT_EMAIL && env.GOOGLE_PRIVATE_KEY
+      ? {
+          type: "service_account",
+          project_id: env.GOOGLE_PROJECT_ID || undefined,
+          client_email: env.GOOGLE_CLIENT_EMAIL,
+          private_key: env.GOOGLE_PRIVATE_KEY
+        }
+      : null;
 
   const seatalkMcpClient = new SeatalkMcpClient({
     endpoint: MCP_ENDPOINT,
@@ -347,8 +356,11 @@ function createServerApp(options = {}) {
     oauthClientId: env.GOOGLE_OAUTH_CLIENT_ID,
     oauthClientSecret: env.GOOGLE_OAUTH_CLIENT_SECRET,
     oauthRedirectUrl: env.GOOGLE_OAUTH_REDIRECT_URL,
+    oauthTokenBase64: env.GOOGLE_OAUTH_TOKEN_BASE64,
+    oauthTokenJson: env.GOOGLE_OAUTH_TOKEN_JSON,
     oauthTokenFile: GOOGLE_OAUTH_TOKEN_FILE,
     serviceAccountFile: GOOGLE_SERVICE_ACCOUNT_FILE,
+    serviceAccountCredentials,
     scopes: GOOGLE_SHEETS_SCOPES,
     logger
   });

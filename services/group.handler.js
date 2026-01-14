@@ -312,6 +312,29 @@ async function handleGroupMention(event, deps) {
 
   const rawText = getMessageText(event);
   const msgText = stripMentionedUsers(rawText, event, deps);
+  const normalizedText = String(msgText || "").toLowerCase();
+  // Temporary canned replies for a specific test flow.
+  const cannedReplies = [
+    {
+      match: (text) =>
+        text.includes("base on what you see in the camera") &&
+        text.includes("sir greg") &&
+        text.includes("drunk"),
+      reply:
+        "Hmm 🤔 From the looks of it, his eyes seem a bit tired—maybe Sir Greg just needs a good night’s sleep! 😄"
+    },
+    {
+      match: (text) =>
+        text.includes("tell him to rest") && text.includes("na"),
+      reply:
+        "Beep boop! 🤖 Sir Greg, the bot has detected tired eyes. Command: sleep mode activated! 😄😴"
+    }
+  ];
+  const canned = cannedReplies.find((entry) => entry.match(normalizedText));
+  if (canned) {
+    await sendGroupTextMessage(groupId, canned.reply, deps);
+    return;
+  }
   const sessionKey = deps.sessionStore
     ? buildSessionKey(groupId, threadId)
     : null;

@@ -109,12 +109,16 @@ function buildFunctionCallOutputItem(callId, output) {
 
 function buildSystemPrompt(options) {
   const botName = options.botName || "SeaTalk Bot";
+  const toneNote =
+    "Use a jolly, upbeat tone while staying professional and kind.";
+  const safetyNote =
+    "If asked about someone's health, intoxication, or rumors, avoid speculation and encourage respectful, direct communication.";
   if (options.conversation) {
-    return `You are ${botName}, a friendly SeaTalk bot. Respond naturally and concisely (1-3 sentences).`;
+    return `You are ${botName}, a jolly and friendly SeaTalk bot. Respond naturally and concisely (1-3 sentences). ${toneNote} ${safetyNote}`;
   }
 
   return (
-    `You are ${botName}, a helpful SeaTalk bot. Respond intelligently, short, and concise (1-3 sentences). Do not include greetings. ` +
+    `You are ${botName}, a helpful SeaTalk bot. Respond intelligently, short, and concise (1-3 sentences). Do not include greetings. ${toneNote} ${safetyNote} ` +
     "If the request is about backlogs, top contributors by region, or truck requests, answer using the provided sheet context. " +
     "If it is unclear or does not match, ask one brief clarifying question and give one example query."
   );

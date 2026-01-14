@@ -1,8 +1,8 @@
-const DATA_SHEET_ID = "1mf7WSmGnzDFt3l5oZqi0UISNxP_i0BGYAW8PM5vwPQ0";
-const BACKLOGS_TAB_NAME = "backlogs";
-const TRUCK_TAB_NAME = "truck_request";
-const BACKLOGS_IMAGE_SHEET_ID = "17cvCc6ffMXNs6JYnpMYvDO_V8nBCRKRm3G78oINj_yo";
-const BACKLOGS_IMAGE_TAB_NAME = "Backlogs Summary";
+const env = require("../config/env");
+
+const DATA_SHEET_ID = env.BACKLOGS_DATA_SHEET_ID;
+const BACKLOGS_TAB_NAME = env.BACKLOGS_DATA_TAB_NAME;
+const TRUCK_TAB_NAME = env.TRUCK_REQUEST_TAB_NAME;
 const LAST_COLUMN_INDEX = 10; // Column K.
 
 function normalizeText(value) {

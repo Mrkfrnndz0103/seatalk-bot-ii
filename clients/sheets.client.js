@@ -22,7 +22,32 @@ function resolveTokenPath() {
   return path.join(__dirname, "..", "google-token.json");
 }
 
-function loadOAuthToken(tokenPath) {
+function loadOAuthTokenFromBase64() {
+  if (!env.GOOGLE_OAUTH_TOKEN_BASE64) {
+    return null;
+  }
+  try {
+    const decoded = Buffer.from(env.GOOGLE_OAUTH_TOKEN_BASE64, "base64").toString("utf8");
+    return JSON.parse(decoded);
+  } catch (error) {
+    logger.warn("google_oauth_token_base64_parse_failed", { error: error.message });
+    return null;
+  }
+}
+
+function loadOAuthTokenFromEnv() {
+  if (!env.GOOGLE_OAUTH_TOKEN_JSON) {
+    return null;
+  }
+  try {
+    return JSON.parse(env.GOOGLE_OAUTH_TOKEN_JSON);
+  } catch (error) {
+    logger.warn("google_oauth_token_env_parse_failed", { error: error.message });
+    return null;
+  }
+}
+
+function loadOAuthTokenFromFile(tokenPath) {
   if (!fs.existsSync(tokenPath)) {
     return null;
   }
@@ -33,6 +58,14 @@ function loadOAuthToken(tokenPath) {
     logger.warn("google_oauth_token_parse_failed", { error: error.message });
     return null;
   }
+}
+
+function loadOAuthToken(tokenPath) {
+  return (
+    loadOAuthTokenFromBase64() ||
+    loadOAuthTokenFromEnv() ||
+    loadOAuthTokenFromFile(tokenPath)
+  );
 }
 
 function hasOAuthConfig() {

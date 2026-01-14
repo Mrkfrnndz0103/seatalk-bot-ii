@@ -9,7 +9,10 @@ function createGoogleAuth(options = {}) {
     oauthClientSecret,
     oauthRedirectUrl,
     oauthTokenFile,
+    oauthTokenBase64,
+    oauthTokenJson,
     serviceAccountFile,
+    serviceAccountCredentials,
     scopes = [],
     logger = defaultLogger
   } = options;
@@ -34,7 +37,36 @@ function createGoogleAuth(options = {}) {
     return Boolean(oauthClientId && oauthClientSecret && oauthRedirectUrl);
   }
 
-  function loadOAuthToken() {
+  function loadOAuthTokenFromBase64() {
+    if (!oauthTokenBase64) {
+      return null;
+    }
+    try {
+      const decoded = Buffer.from(oauthTokenBase64, "base64").toString("utf8");
+      return JSON.parse(decoded);
+    } catch (error) {
+      logger.warn("google_oauth_token_base64_parse_failed", {
+        error: error.message
+      });
+      return null;
+    }
+  }
+
+  function loadOAuthTokenFromEnv() {
+    if (!oauthTokenJson) {
+      return null;
+    }
+    try {
+      return JSON.parse(oauthTokenJson);
+    } catch (error) {
+      logger.warn("google_oauth_token_env_parse_failed", {
+        error: error.message
+      });
+      return null;
+    }
+  }
+
+  function loadOAuthTokenFromFile() {
     if (!fs.existsSync(tokenFilePath)) {
       return null;
     }
@@ -45,6 +77,14 @@ function createGoogleAuth(options = {}) {
       logger.warn("google_oauth_token_parse_failed", { error: error.message });
       return null;
     }
+  }
+
+  function loadOAuthToken() {
+    return (
+      loadOAuthTokenFromBase64() ||
+      loadOAuthTokenFromEnv() ||
+      loadOAuthTokenFromFile()
+    );
   }
 
   function saveOAuthToken(token) {
@@ -75,24 +115,27 @@ function createGoogleAuth(options = {}) {
   }
 
   async function initServiceAccountClient() {
-    if (!serviceAccountPath) {
-      return null;
-    }
+    let credentials = null;
 
-    if (!fs.existsSync(serviceAccountPath)) {
-      logger.warn("google_service_account_missing", {
-        path: serviceAccountPath
-      });
-      return null;
-    }
+    if (serviceAccountCredentials && typeof serviceAccountCredentials === "object") {
+      credentials = serviceAccountCredentials;
+    } else if (serviceAccountPath) {
+      if (!fs.existsSync(serviceAccountPath)) {
+        logger.warn("google_service_account_missing", {
+          path: serviceAccountPath
+        });
+        return null;
+      }
 
-    let credentials;
-    try {
-      credentials = JSON.parse(fs.readFileSync(serviceAccountPath, "utf8"));
-    } catch (error) {
-      logger.warn("google_service_account_parse_failed", {
-        error: error.message
-      });
+      try {
+        credentials = JSON.parse(fs.readFileSync(serviceAccountPath, "utf8"));
+      } catch (error) {
+        logger.warn("google_service_account_parse_failed", {
+          error: error.message
+        });
+        return null;
+      }
+    } else {
       return null;
     }
 

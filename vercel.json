@@ -1,0 +1,7 @@
+{
+  "version": 2,
+  "routes": [
+    { "src": "/api/cron", "dest": "/api/cron.js" },
+    { "src": "/(.*)", "dest": "/api/index.js" }
+  ]
+}

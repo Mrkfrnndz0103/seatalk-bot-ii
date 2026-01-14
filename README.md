@@ -91,8 +91,3 @@ See `.env.example` for the full list.
 - Use `/search <query> --ai` to force LLM summarization per request.
 - `SEARCH_LLM_TIMEOUT_MS` caps LLM latency.
 - `SEARCH_LLM_CACHE_TTL_MS` caches LLM summaries for repeated queries.
-
-## Render Deployment
-
-- Use `render.yaml` for build/start commands and the `/ready` health check.
-- Attach a persistent disk if you want `INDEX_STORE_PATH` data to survive deploys.

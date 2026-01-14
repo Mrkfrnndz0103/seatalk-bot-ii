@@ -1,5 +1,6 @@
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 const AdmZip = require("adm-zip");
 
 const HEADER_ALIASES = {
@@ -210,6 +211,19 @@ function extractRowsFromZip(buffer, logger) {
   return { csvCount, rows: allRows };
 }
 
+function extractRowsFromCsvFiles(files, readFile, logger) {
+  const allRows = [];
+  for (const file of files) {
+    const csvText = readFile(file);
+    if (!csvText) {
+      continue;
+    }
+    const rows = extractRowsFromCsv(csvText, logger, file.name);
+    allRows.push(...rows);
+  }
+  return allRows;
+}
+
 function dedupeRows(rows) {
   const map = new Map();
   rows.forEach((row) => {
@@ -331,7 +345,41 @@ function sanitizeTabName(tabName) {
   return trimmed;
 }
 
-async function listZipFiles(driveApi, folderId) {
+async function downloadDriveFile(driveApi, fileId) {
+  const response = await driveApi.files.get(
+    { fileId, alt: "media", supportsAllDrives: true },
+    { responseType: "arraybuffer" }
+  );
+  return Buffer.from(response.data);
+}
+
+function isCsvFile(file) {
+  const name = String(file?.name || "");
+  const mimeType = String(file?.mimeType || "").toLowerCase();
+  if (/\.csv$/i.test(name)) {
+    return true;
+  }
+  return mimeType.includes("csv");
+}
+
+function isZipFile(file) {
+  const name = String(file?.name || "");
+  const mimeType = String(file?.mimeType || "").toLowerCase();
+  if (/\.zip$/i.test(name)) {
+    return true;
+  }
+  return mimeType === "application/zip";
+}
+
+function sortByModifiedDesc(files) {
+  return [...files].sort((a, b) => {
+    const aTime = Date.parse(a.modifiedTime || a.createdTime || 0) || 0;
+    const bTime = Date.parse(b.modifiedTime || b.createdTime || 0) || 0;
+    return bTime - aTime;
+  });
+}
+
+async function listDriveFiles(driveApi, folderId) {
   const response = await driveApi.files.list({
     q: `'${folderId}' in parents and trashed = false`,
     fields: "files(id,name,mimeType,modifiedTime,createdTime,size)",
@@ -340,15 +388,25 @@ async function listZipFiles(driveApi, folderId) {
     supportsAllDrives: true
   });
   const files = response.data.files || [];
-  return files.filter((file) => /\.zip$/i.test(file.name || ""));
+  const csvFiles = files.filter(isCsvFile);
+  const zipFiles = files.filter(isZipFile);
+  return {
+    csvFiles: sortByModifiedDesc(csvFiles),
+    zipFiles: sortByModifiedDesc(zipFiles)
+  };
 }
 
-async function downloadDriveFile(driveApi, fileId) {
-  const response = await driveApi.files.get(
-    { fileId, alt: "media", supportsAllDrives: true },
-    { responseType: "arraybuffer" }
+function buildFilesFingerprint(files) {
+  const sorted = [...files].sort((a, b) =>
+    String(a.id || "").localeCompare(String(b.id || ""))
   );
-  return Buffer.from(response.data);
+  const payload = sorted
+    .map(
+      (file) =>
+        `${file.id || ""}:${file.modifiedTime || ""}:${file.size || ""}`
+    )
+    .join("|");
+  return crypto.createHash("sha256").update(payload).digest("hex");
 }
 
 async function writeSheetRows({
@@ -428,35 +486,95 @@ function createDriveZipSync(options = {}) {
         return;
       }
 
-      const files = await listZipFiles(driveApi, folderId);
-      if (!files.length) {
+      const { csvFiles, zipFiles } = await listDriveFiles(driveApi, folderId);
+      if (!csvFiles.length && !zipFiles.length) {
         if (logger && logger.info) {
-          logger.info("drive_sync_no_zip_files");
+          logger.info("drive_sync_no_files");
         }
         return;
       }
 
-      const latest = files[0];
       const state = loadSyncState(statePath);
-      if (
-        state.lastProcessedFileId === latest.id &&
-        state.lastProcessedModifiedTime === latest.modifiedTime
-      ) {
-        if (logger && logger.info) {
-          logger.info("drive_sync_no_new_zip", {
-            fileId: latest.id,
-            name: latest.name
-          });
+      let sourceLabel = "";
+      let csvCount = 0;
+      let rows = [];
+      let fingerprint = "";
+      let stateUpdate = {};
+
+      if (csvFiles.length) {
+        fingerprint = buildFilesFingerprint(csvFiles);
+        if (state.lastProcessedFingerprint === fingerprint) {
+          if (logger && logger.info) {
+            logger.info("drive_sync_no_new_csv", {
+              fileCount: csvFiles.length
+            });
+          }
+          return;
         }
-        return;
+
+        const csvContents = new Map();
+        for (const file of csvFiles) {
+          try {
+            const buffer = await downloadDriveFile(driveApi, file.id);
+            if (buffer) {
+              csvContents.set(file.id, buffer.toString("utf8"));
+            }
+          } catch (error) {
+            if (logger && logger.warn) {
+              logger.warn("drive_sync_csv_download_failed", {
+                fileId: file.id,
+                name: file.name,
+                error: error.response?.data || error.message
+              });
+            }
+          }
+        }
+
+        const rowsFromCsv = extractRowsFromCsvFiles(
+          csvFiles,
+          (file) => csvContents.get(file.id) || "",
+          logger
+        );
+        rows = rowsFromCsv;
+        csvCount = csvFiles.length;
+        sourceLabel = "csv";
+        stateUpdate = {
+          lastProcessedFingerprint: fingerprint,
+          lastProcessedFileCount: csvFiles.length
+        };
+      } else {
+        const latest = zipFiles[0];
+        fingerprint = buildFilesFingerprint([latest]);
+        if (
+          state.lastProcessedFingerprint === fingerprint ||
+          (state.lastProcessedFileId === latest.id &&
+            state.lastProcessedModifiedTime === latest.modifiedTime)
+        ) {
+          if (logger && logger.info) {
+            logger.info("drive_sync_no_new_zip", {
+              fileId: latest.id,
+              name: latest.name
+            });
+          }
+          return;
+        }
+
+        const buffer = await downloadDriveFile(driveApi, latest.id);
+        const extracted = extractRowsFromZip(buffer, logger);
+        csvCount = extracted.csvCount;
+        rows = extracted.rows;
+        sourceLabel = "zip";
+        stateUpdate = {
+          lastProcessedFileId: latest.id,
+          lastProcessedModifiedTime: latest.modifiedTime,
+          lastProcessedName: latest.name,
+          lastProcessedFingerprint: fingerprint
+        };
       }
 
-      const buffer = await downloadDriveFile(driveApi, latest.id);
-      const { csvCount, rows } = extractRowsFromZip(buffer, logger);
       if (minCsvWarn && csvCount < minCsvWarn && logger && logger.warn) {
         logger.warn("drive_sync_low_csv_count", {
-          fileId: latest.id,
-          name: latest.name,
+          source: sourceLabel,
           csvCount
         });
       }
@@ -474,9 +592,7 @@ function createDriveZipSync(options = {}) {
       });
 
       saveSyncState(statePath, {
-        lastProcessedFileId: latest.id,
-        lastProcessedModifiedTime: latest.modifiedTime,
-        lastProcessedName: latest.name,
+        ...stateUpdate,
         lastProcessedAt: new Date().toISOString(),
         csvCount,
         totalRows: rows.length,
@@ -487,8 +603,7 @@ function createDriveZipSync(options = {}) {
 
       if (logger && logger.info) {
         logger.info("drive_sync_complete", {
-          fileId: latest.id,
-          name: latest.name,
+          source: sourceLabel,
           csvCount,
           totalRows: rows.length,
           dedupedRows: deduped.length,

@@ -1,4 +1,7 @@
-const DEFAULT_INDEX_STORE_PATH = "./data/chunks.jsonl";
+const IS_VERCEL = Boolean(process.env.VERCEL || process.env.VERCEL_ENV);
+const DEFAULT_INDEX_STORE_PATH = IS_VERCEL
+  ? "/tmp/chunks.jsonl"
+  : "./data/chunks.jsonl";
 const DEFAULT_SHEETS_FILE = "./sheets.txt";
 const DEFAULT_MAX_ROWS_TO_SCAN = 2000;
 const DEFAULT_MAX_COLS_TO_SCAN = 200;
@@ -23,10 +26,17 @@ const DEFAULT_BACKLOGS_IMAGE_SHEET_ID =
 const DEFAULT_BACKLOGS_IMAGE_TAB_NAME = "Backlogs Summary";
 const DEFAULT_BACKLOGS_IMAGE_RANGE = "B2:R67";
 const DEFAULT_BACKLOGS_MONITOR_RANGE = DEFAULT_BACKLOGS_IMAGE_RANGE;
-const DEFAULT_BACKLOGS_MONITOR_STATE_PATH = "./data/backlogs-monitor.json";
+const DEFAULT_BACKLOGS_MONITOR_STATE_PATH = IS_VERCEL
+  ? "/tmp/backlogs-monitor.json"
+  : "./data/backlogs-monitor.json";
 const DEFAULT_BACKLOGS_TIMEZONE = "Asia/Manila";
 const DEFAULT_SYNC_START_CELL = "A2";
-const DEFAULT_SYNC_STATE_PATH = "./data/drive-sync-state.json";
+const DEFAULT_SYNC_STATE_PATH = IS_VERCEL
+  ? "/tmp/drive-sync-state.json"
+  : "./data/drive-sync-state.json";
+const DEFAULT_GOOGLE_OAUTH_TOKEN_FILE = IS_VERCEL
+  ? "/tmp/google-token.json"
+  : "";
 const DEFAULT_SYNC_MIN_CSV_WARN = 5;
 
 function parseNonNegativeInt(value, fallback) {
@@ -148,7 +158,8 @@ const env = {
   GOOGLE_OAUTH_CLIENT_ID: process.env.GOOGLE_OAUTH_CLIENT_ID || "",
   GOOGLE_OAUTH_CLIENT_SECRET: process.env.GOOGLE_OAUTH_CLIENT_SECRET || "",
   GOOGLE_OAUTH_REDIRECT_URL: process.env.GOOGLE_OAUTH_REDIRECT_URL || "",
-  GOOGLE_OAUTH_TOKEN_FILE: process.env.GOOGLE_OAUTH_TOKEN_FILE || "",
+  GOOGLE_OAUTH_TOKEN_FILE:
+    process.env.GOOGLE_OAUTH_TOKEN_FILE || DEFAULT_GOOGLE_OAUTH_TOKEN_FILE,
   GOOGLE_SERVICE_ACCOUNT_FILE: process.env.GOOGLE_SERVICE_ACCOUNT_FILE || "",
   GOOGLE_SHEETS_SCOPES: (process.env.GOOGLE_SHEETS_SCOPES ||
     "https://www.googleapis.com/auth/spreadsheets,https://www.googleapis.com/auth/drive.readonly")

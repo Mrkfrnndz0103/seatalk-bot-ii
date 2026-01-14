@@ -1,7 +1,9 @@
 require("dotenv").config();
 
+const { initSentry, captureException, flush } = require("../server/sentry");
+initSentry();
+
 const { createServerApp } = require("../server/server");
-const { captureException, flush } = require("../server/sentry");
 
 const { runScheduledTasks } = createServerApp({
   enableScheduler: false,

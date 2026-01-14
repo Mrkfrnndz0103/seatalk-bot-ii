@@ -24,7 +24,6 @@ const { createBacklogsPublisher } = require("../src/backlogs/publisher");
 const { createGoogleAuth } = require("../src/sheets/google.auth");
 const { createSheetsService } = require("../src/sheets/sheets.service");
 const { createApp } = require("./app");
-const { initSentry } = require("./sentry");
 const { normalizeText, escapeRegExp } = require("../src/utils/text");
 
 const KNOWN_COMMANDS = new Set(["help", "search", "reindex"]);
@@ -208,7 +207,6 @@ function createServerApp(options = {}) {
     enableSheetRefreshTimer = true,
     exitOnInvalidConfig = true
   } = options;
-  initSentry();
   const indexStore = new FileStore({ path: env.INDEX_STORE_PATH });
   indexStore.load();
   const groupSessionStore = new SessionStore();

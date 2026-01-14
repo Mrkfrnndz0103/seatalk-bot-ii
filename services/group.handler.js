@@ -317,7 +317,7 @@ async function handleGroupMention(event, deps) {
   const cannedReplies = [
     {
       match: (text) =>
-        text.includes("base on what you see in the camera") &&
+        text.includes("base on what you see is") &&
         text.includes("sir greg") &&
         text.includes("drunk"),
       reply:

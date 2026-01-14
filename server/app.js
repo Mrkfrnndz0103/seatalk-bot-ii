@@ -1,5 +1,6 @@
 const path = require("path");
 const express = require("express");
+const { setupExpressErrorHandler } = require("./sentry");
 const { rawBodySaver } = require("../src/http/middleware/rawBody");
 const {
   createRequestContextMiddleware
@@ -67,6 +68,7 @@ function createApp(options = {}) {
   app.get("/", (req, res) => {
     res.status(200).send("Seatalk bot service is running.");
   });
+  setupExpressErrorHandler(app);
 
   return app;
 }

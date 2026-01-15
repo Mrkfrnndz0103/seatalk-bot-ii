@@ -26,6 +26,30 @@ function createProfileService(options = {}) {
     logger
   );
 
+  function applyNameOverride(profile, identity) {
+    if (!profile) {
+      return profile;
+    }
+
+    const email = String(profile.email || identity?.email || "")
+      .toLowerCase()
+      .trim();
+    if (!email) {
+      return profile;
+    }
+
+    const override = greetingOverrides.get(email);
+    if (!override || !override.name) {
+      return profile;
+    }
+
+    return {
+      ...profile,
+      name: override.name,
+      email: profile.email || identity?.email || null
+    };
+  }
+
   function getSeatalkIdentity(event) {
     const sender = event?.sender || event?.message?.sender || null;
     return {
@@ -405,11 +429,14 @@ function createProfileService(options = {}) {
     const identity = getSeatalkIdentity(event);
 
     if (cached?.name) {
-      return {
-        name: cached.name,
-        gender: cached.gender,
-        email: cached.email || identity.email || null
-      };
+      return applyNameOverride(
+        {
+          name: cached.name,
+          gender: cached.gender,
+          email: cached.email || identity.email || null
+        },
+        identity
+      );
     }
 
     const fetched = await fetchSeatalkProfile(event);
@@ -417,17 +444,21 @@ function createProfileService(options = {}) {
       const profile = {
         name: fetched.name,
         gender: fetched.gender,
-        email: identity.email || null
+        email: fetched.email || identity.email || null
       };
-      cacheProfile(cacheKey, profile);
-      return profile;
+      const finalProfile = applyNameOverride(profile, identity);
+      cacheProfile(cacheKey, finalProfile);
+      return finalProfile;
     }
 
-    return {
-      name: formatUserName(event),
-      gender: null,
-      email: identity.email || null
-    };
+    return applyNameOverride(
+      {
+        name: formatUserName(event),
+        gender: null,
+        email: identity.email || null
+      },
+      identity
+    );
   }
 
   async function buildGreeting(event) {

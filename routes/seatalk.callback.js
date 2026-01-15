@@ -57,6 +57,17 @@ function createSeatalkCallbackRouter(options = {}) {
     const data = req.body || {};
     const eventType = data.event_type || "unknown";
     const eventPayload = data.event || data;
+    const sender =
+      eventPayload?.sender ||
+      eventPayload?.message?.sender ||
+      eventPayload?.actor ||
+      null;
+    const eventEmail =
+      typeof eventPayload?.email === "string"
+        ? eventPayload.email.trim()
+        : "";
+    const senderEmail =
+      typeof sender?.email === "string" ? sender.email.trim() : "";
     const track = (type, details) =>
       trackEvent({
         type,
@@ -73,6 +84,16 @@ function createSeatalkCallbackRouter(options = {}) {
     logger?.info?.("seatalk_event_received", {
       requestId,
       eventType
+    });
+    logger?.info?.("seatalk_event_email_presence", {
+      requestId,
+      eventType,
+      hasEventEmail: Boolean(eventEmail),
+      hasSenderEmail: Boolean(senderEmail),
+      senderKeys:
+        sender && typeof sender === "object"
+          ? Object.keys(sender).slice(0, 12)
+          : []
     });
 
     if (eventType === EVENT_VERIFICATION) {

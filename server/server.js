@@ -7,7 +7,6 @@ const intentService = require("../services/intent.service");
 const groupHandler = require("../services/group.handler");
 const interactiveHandler = require("../services/interactive.handler");
 const scheduler = require("../services/scheduler");
-const { createDriveZipSync } = require("../services/drive.sync");
 const { logger } = require("../utils/logger");
 const { BotEventType } = require("../events/event.types");
 const { mapSeatalkEventType } = require("../events/event.mapper");
@@ -20,8 +19,6 @@ const { createSeatalkAuth } = require("../src/seatalk/auth");
 const { createSeatalkMessaging } = require("../src/seatalk/messaging");
 const { createProfileService } = require("../src/profile/profile.service");
 const { createSubscriberHandler } = require("../services/subscriber.handler");
-const { createBacklogsPublisher } = require("../src/backlogs/publisher");
-const { createDriveWatch } = require("../services/drive.watch");
 const { createGoogleAuth } = require("../src/sheets/google.auth");
 const { createSheetsService } = require("../src/sheets/sheets.service");
 const { createApp } = require("./app");
@@ -262,20 +259,6 @@ function createServerApp(options = {}) {
   const MCP_TIMEOUT_MS = env.MCP_TIMEOUT_MS;
   const MCP_RETRY_MAX = env.MCP_RETRY_MAX;
   const MCP_RETRY_BASE_MS = env.MCP_RETRY_BASE_MS;
-  const BACKLOGS_SCHEDULED_GROUP_ID = env.BACKLOGS_SCHEDULED_GROUP_ID;
-  const BACKLOGS_IMAGE_SHEET_ID = env.BACKLOGS_IMAGE_SHEET_ID;
-  const BACKLOGS_IMAGE_TAB_NAME = env.BACKLOGS_IMAGE_TAB_NAME;
-  const BACKLOGS_IMAGE_GID = env.BACKLOGS_IMAGE_GID;
-  const BACKLOGS_IMAGE_RANGE = env.BACKLOGS_IMAGE_RANGE;
-  const BACKLOGS_MONITOR_RANGE = env.BACKLOGS_MONITOR_RANGE;
-  const BACKLOGS_MONITOR_STATE_PATH = env.BACKLOGS_MONITOR_STATE_PATH;
-  const BACKLOGS_TIMEZONE = env.BACKLOGS_TIMEZONE;
-  const SYNC_DRIVE_FOLDER_ID = env.SYNC_DRIVE_FOLDER_ID;
-  const SYNC_SHEET_ID = env.SYNC_SHEET_ID;
-  const SYNC_SHEET_TAB_NAME = env.SYNC_SHEET_TAB_NAME;
-  const SYNC_START_CELL = env.SYNC_START_CELL;
-  const SYNC_STATE_PATH = env.SYNC_STATE_PATH;
-  const SYNC_MIN_CSV_WARN = env.SYNC_MIN_CSV_WARN;
   const serviceAccountCredentials =
     env.GOOGLE_CLIENT_EMAIL && env.GOOGLE_PRIVATE_KEY
       ? {
@@ -384,47 +367,6 @@ function createServerApp(options = {}) {
 
   const stripBotMention = createStripBotMention(BOT_NAME);
 
-  const runDriveZipSync = createDriveZipSync({
-    getDriveApi: googleAuth.getDriveApi,
-    getSheetsApi: googleAuth.getSheetsApi,
-    logger,
-    folderId: SYNC_DRIVE_FOLDER_ID,
-    sheetId: SYNC_SHEET_ID,
-    tabName: SYNC_SHEET_TAB_NAME,
-    startCell: SYNC_START_CELL,
-    statePath: SYNC_STATE_PATH,
-    minCsvWarn: SYNC_MIN_CSV_WARN
-  });
-
-  const backlogsPublisher = createBacklogsPublisher({
-    sheetId: BACKLOGS_IMAGE_SHEET_ID,
-    tabName: BACKLOGS_IMAGE_TAB_NAME,
-    imageRange: BACKLOGS_IMAGE_RANGE,
-    monitorRange: BACKLOGS_MONITOR_RANGE,
-    monitorStatePath: BACKLOGS_MONITOR_STATE_PATH,
-    timezone: BACKLOGS_TIMEZONE,
-    groupId: BACKLOGS_SCHEDULED_GROUP_ID,
-    imageGid: BACKLOGS_IMAGE_GID,
-    readSheetRange: sheetsService.readSheetRange,
-    fetchSheetTabId: sheetsService.fetchSheetTabId,
-    getGoogleAccessTokenCandidates: googleAuth.getGoogleAccessTokenCandidates,
-    sendGroupMessage,
-    trackEvent: (details) =>
-      trackEvent(BotEventType.BACKLOGS_SCHEDULED, details),
-    logger
-  });
-  const { sendBacklogsScheduledUpdate } = backlogsPublisher;
-
-  const driveWatch = createDriveWatch({
-    getDriveApi: googleAuth.getDriveApi,
-    fileId: env.DRIVE_WATCH_FILE_ID,
-    address: env.DRIVE_WATCH_WEBHOOK_URL,
-    token: env.DRIVE_WATCH_TOKEN,
-    statePath: env.DRIVE_WATCH_STATE_PATH,
-    ttlMs: env.DRIVE_WATCH_TTL_MS,
-    renewWindowMs: env.DRIVE_WATCH_RENEW_WINDOW_MS,
-    logger
-  });
 
   function trackSystemEvent(type, details) {
     trackEvent({
@@ -494,11 +436,7 @@ function createServerApp(options = {}) {
     sendSubscriberTyping
   });
 
-  async function runScheduledTasks() {
-    await driveWatch.ensureWatch();
-    await runDriveZipSync();
-    await sendBacklogsScheduledUpdate();
-  }
+  async function runScheduledTasks() {}
 
   const app = createApp({
     logger,
@@ -555,20 +493,10 @@ function createServerApp(options = {}) {
       apiBaseUrl: SEATALK_API_BASE_URL,
       indexStore,
       groupSessionStore
-    },
-    driveWatch: {
-      logger,
-      driveWatch,
-      onDriveChange: async () => {
-        await sendBacklogsScheduledUpdate();
-      }
     }
   });
 
   validateStartupConfig({ exitOnFailure: exitOnInvalidConfig });
-  driveWatch.ensureWatch().catch((error) => {
-    logger.warn("drive_watch_init_failed", { error: error.message });
-  });
   if (enableSheetRefreshTimer) {
     sheetsService.startSheetRefreshTimer();
   }

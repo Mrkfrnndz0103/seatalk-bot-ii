@@ -12,7 +12,6 @@ const { createHealthRouter } = require("../routes/health");
 const { createSeatalkEventsRouter } = require("../routes/seatalk.events");
 const { createSeatalkNotifyRouter } = require("../routes/seatalk.notify");
 const { createSeatalkCallbackRouter } = require("../routes/seatalk.callback");
-const { createDriveWatchRouter } = require("../routes/drive.watch");
 
 function createApp(options = {}) {
   const {
@@ -24,8 +23,7 @@ function createApp(options = {}) {
     health,
     seatalkEvents,
     seatalkNotify,
-    seatalkCallback,
-    driveWatch
+    seatalkCallback
   } = options;
 
   const app = express();
@@ -58,9 +56,6 @@ function createApp(options = {}) {
   app.use(createSeatalkEventsRouter(seatalkEvents));
   app.use(createSeatalkNotifyRouter(seatalkNotify));
   app.use(createSeatalkCallbackRouter(seatalkCallback));
-  if (driveWatch) {
-    app.use(createDriveWatchRouter(driveWatch));
-  }
   app.get(["/favicon.ico", "/favicon.png"], (req, res) => {
     const faviconPath = path.join(publicDir, "favicon.png");
     res.type("png");

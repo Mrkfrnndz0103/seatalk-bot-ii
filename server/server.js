@@ -259,6 +259,20 @@ function createServerApp(options = {}) {
   const MCP_TIMEOUT_MS = env.MCP_TIMEOUT_MS;
   const MCP_RETRY_MAX = env.MCP_RETRY_MAX;
   const MCP_RETRY_BASE_MS = env.MCP_RETRY_BASE_MS;
+  const isProduction = process.env.NODE_ENV === "production";
+  const mcpEnabled =
+    Boolean(MCP_ENDPOINT) ||
+    MCP_TRANSPORT === "stdio" ||
+    (MCP_TRANSPORT === "auto" && !isProduction);
+  const mcpSpawnEnv = {
+    SEATALK_APP_ID,
+    SEATALK_APP_SECRET
+  };
+  if (process.env.VERCEL) {
+    mcpSpawnEnv.HOME = "/tmp";
+    mcpSpawnEnv.NPM_CONFIG_CACHE = "/tmp/.npm";
+    mcpSpawnEnv.npm_config_cache = "/tmp/.npm";
+  }
   const serviceAccountCredentials =
     env.GOOGLE_CLIENT_EMAIL && env.GOOGLE_PRIVATE_KEY
       ? {
@@ -269,21 +283,22 @@ function createServerApp(options = {}) {
         }
       : null;
 
-  const seatalkMcpClient = new SeatalkMcpClient({
-    endpoint: MCP_ENDPOINT,
-    transport: MCP_TRANSPORT,
-    serverName: MCP_SERVER_NAME,
-    spawnEnv: {
-      SEATALK_APP_ID,
-      SEATALK_APP_SECRET
-    },
-    timeoutMs: MCP_TIMEOUT_MS,
-    retryMax: MCP_RETRY_MAX,
-    retryBaseMs: MCP_RETRY_BASE_MS,
-    logger
-  });
+  const seatalkMcpClient = mcpEnabled
+    ? new SeatalkMcpClient({
+        endpoint: MCP_ENDPOINT,
+        transport: MCP_TRANSPORT,
+        serverName: MCP_SERVER_NAME,
+        spawnEnv: mcpSpawnEnv,
+        timeoutMs: MCP_TIMEOUT_MS,
+        retryMax: MCP_RETRY_MAX,
+        retryBaseMs: MCP_RETRY_BASE_MS,
+        logger
+      })
+    : null;
 
-  const seatalkMcpTools = createSeatalkMcpTools(seatalkMcpClient, logger);
+  const seatalkMcpTools = mcpEnabled
+    ? createSeatalkMcpTools(seatalkMcpClient, logger)
+    : null;
 
   const llmAgent = createLlmAgent({
     apiKey: OPENROUTER_API_KEY,
@@ -293,8 +308,8 @@ function createServerApp(options = {}) {
     appTitle: OPENROUTER_APP_TITLE,
     timeoutMs: env.OPENROUTER_HTTP_TIMEOUT_MS,
     botName: BOT_NAME,
-    toolDefinitions: seatalkMcpTools.definitions,
-    toolHandlers: seatalkMcpTools.tools,
+    toolDefinitions: seatalkMcpTools ? seatalkMcpTools.definitions : [],
+    toolHandlers: seatalkMcpTools ? seatalkMcpTools.tools : {},
     logger
   });
 

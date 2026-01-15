@@ -1,5 +1,10 @@
 {
   "version": 2,
+  "functions": {
+    "api/index.js": {
+      "includeFiles": ["colleague.txt"]
+    }
+  },
   "routes": [
     { "src": "/api/cron", "dest": "/api/cron.js" },
     { "src": "/(.*)", "dest": "/api/index.js" }

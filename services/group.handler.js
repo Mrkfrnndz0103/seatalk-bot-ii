@@ -455,18 +455,18 @@ async function handleGroupMention(event, deps) {
     deps.trackEvent(BotEventType.FALLBACK, { reason: "no_intent" });
   }
 
-  const reply = await deps.handleIntentMessage(msgText, {
+  const intentReply = await deps.handleIntentMessage(msgText, {
     sheetCache: deps.sheetCache,
     refreshSheetCache: deps.refreshSheetCache,
     includeFallback: false,
     readSheetRange: deps.readSheetRange
   });
 
-  if (reply && reply.text) {
+  if (intentReply && intentReply.text) {
     const lead = getPositiveLead();
-    const content = lead ? `${lead}\n\n${reply.text}` : reply.text;
-    const reply = applyHonorificPrefix(content, event, deps);
-    await sendGroupTextMessage(groupId, reply, deps);
+    const content = lead ? `${lead}\n\n${intentReply.text}` : intentReply.text;
+    const formattedReply = applyHonorificPrefix(content, event, deps);
+    await sendGroupTextMessage(groupId, formattedReply, deps);
     return;
   }
 

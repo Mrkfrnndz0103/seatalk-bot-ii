@@ -8,7 +8,11 @@ function shouldPrefetchChatHistory(message) {
     return false;
   }
 
-  if (normalized.includes("backlog") || normalized.includes("status")) {
+  if (
+    normalized.includes("backlog") ||
+    normalized.includes("baclog") ||
+    normalized.includes("status")
+  ) {
     return true;
   }
 

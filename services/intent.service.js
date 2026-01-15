@@ -172,7 +172,9 @@ function detectIntent(message) {
     return null;
   }
 
-  if (/\bbacklog\b|\bbacklogs\b|\bdashboard\b|\bpending\b/.test(normalized)) {
+  if (
+    /\bbacklogs?\b|\bbaclogs?\b|\bdashboard\b|\bpending\b/.test(normalized)
+  ) {
     return "backlogs";
   }
 

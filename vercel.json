@@ -5,7 +5,7 @@
       "includeFiles": "colleague.txt"
     }
   },
-  "cron": [
+  "crons": [
     {
       "path": "/api/cron",
       "schedule": "*/5 * * * *"

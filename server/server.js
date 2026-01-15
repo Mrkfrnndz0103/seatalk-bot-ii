@@ -19,6 +19,7 @@ const { createSeatalkAuth } = require("../src/seatalk/auth");
 const { createSeatalkMessaging } = require("../src/seatalk/messaging");
 const { createProfileService } = require("../src/profile/profile.service");
 const { createSubscriberHandler } = require("../services/subscriber.handler");
+const { createTruckPlateAlert } = require("../services/truck.alert");
 const { createGoogleAuth } = require("../src/sheets/google.auth");
 const { createSheetsService } = require("../src/sheets/sheets.service");
 const { createApp } = require("./app");
@@ -382,6 +383,17 @@ function createServerApp(options = {}) {
 
   const stripBotMention = createStripBotMention(BOT_NAME);
 
+  const truckPlateAlert = createTruckPlateAlert({
+    spreadsheetId: env.TRUCK_ALERT_SHEET_ID,
+    tabName: env.TRUCK_ALERT_TAB_NAME,
+    startRow: env.TRUCK_ALERT_START_ROW,
+    groupId: env.TRUCK_ALERT_GROUP_ID,
+    statePath: env.TRUCK_ALERT_STATE_PATH,
+    readSheetRange: sheetsService.readSheetRange,
+    sendGroupMessage,
+    logger
+  });
+
 
   function trackSystemEvent(type, details) {
     trackEvent({
@@ -451,7 +463,9 @@ function createServerApp(options = {}) {
     sendSubscriberTyping
   });
 
-  async function runScheduledTasks() {}
+  async function runScheduledTasks() {
+    await truckPlateAlert.run();
+  }
 
   const app = createApp({
     logger,

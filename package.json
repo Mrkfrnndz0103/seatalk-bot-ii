@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node index.js",
     "test": "node --test",
-    "reindex": "node scripts/reindex.js"
+    "reindex": "node scripts/reindex.js",
+    "dev": "node --dev"
   },
   "keywords": [],
   "author": "",

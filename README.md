@@ -12,13 +12,31 @@ npm install
 
 2) Create `.env` using `.env.example`.
 
-3) Configure `sheets.txt` with one spreadsheet URL per line (used for `/search` indexing). Backlogs/truck intents read from the fixed sheet IDs in `services/intent.service.js`.
+3) Configure `sheets.txt` with one spreadsheet URL per line (used for `/search` indexing). You can add an optional range after the URL using `|`, e.g. `.../edit#gid=0 | A1:Z200`. Backlogs/truck intents read from the fixed sheet IDs in `services/intent.service.js`.
 
 ## Run
 
 ```bash
 npm start
 ```
+
+## Deploy (Render)
+
+1) Push this repo to GitHub (Render deploys from GitHub).
+2) Create a new Web Service in Render and connect the repo.
+3) Build Command: `npm install`
+4) Start Command: `npm start`
+5) Add a persistent disk:
+   - Mount path: `/data`
+   - Size: 1 GB
+6) Set env vars in Render:
+   - `SIGNING_SECRET`
+   - `BOT_ACCESS_TOKEN` or `SEATALK_APP_ID`, `SEATALK_APP_SECRET`,
+     `SEATALK_TOKEN_URL`
+   - `INDEX_STORE_PATH=/data/chunks.jsonl`
+   - `TRUCK_ALERT_STATE_PATH=/data/truck-alert-state.json` (optional)
+7) Set the SeaTalk callback URL:
+   - `https://<your-render-service>.onrender.com/seatalk/callback`
 
 ## Commands
 

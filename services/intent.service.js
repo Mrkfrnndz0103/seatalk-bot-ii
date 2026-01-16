@@ -2,7 +2,11 @@ const env = require("../config/env");
 
 const DATA_SHEET_ID = env.BACKLOGS_DATA_SHEET_ID;
 const BACKLOGS_TAB_NAME = env.BACKLOGS_DATA_TAB_NAME;
+const BACKLOGS_SUMMARY_RANGE = env.BACKLOGS_SUMMARY_RANGE;
+const BACKLOGS_CONTRIBUTORS_RANGE = env.BACKLOGS_CONTRIBUTORS_RANGE;
+const BACKLOGS_CLUSTER_RANGES_JSON = env.BACKLOGS_CLUSTER_RANGES_JSON;
 const TRUCK_TAB_NAME = env.TRUCK_REQUEST_TAB_NAME;
+const TRUCK_REQUEST_RANGE = env.TRUCK_REQUEST_RANGE;
 const LAST_COLUMN_INDEX = 10; // Column K.
 
 function normalizeText(value) {
@@ -12,6 +16,59 @@ function normalizeText(value) {
     .replace(/\s+/g, " ")
     .trim();
 }
+
+function normalizeRangeKey(value) {
+  return normalizeText(value).replace(/\s+/g, "");
+}
+
+function resolveTabRange(tabName, range) {
+  const normalized = String(range || "").trim();
+  if (!normalized) {
+    return "";
+  }
+  if (normalized.includes("!")) {
+    return normalized;
+  }
+  return tabName ? `${tabName}!${normalized}` : normalized;
+}
+
+function stripTabPrefix(range) {
+  const normalized = String(range || "").trim();
+  if (!normalized) {
+    return "";
+  }
+  const bangIndex = normalized.indexOf("!");
+  return bangIndex >= 0 ? normalized.slice(bangIndex + 1) : normalized;
+}
+
+function parseClusterRanges(raw) {
+  const overrides = {};
+  if (!raw) {
+    return overrides;
+  }
+
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") {
+      return overrides;
+    }
+    Object.entries(parsed).forEach(([key, value]) => {
+      const normalizedKey = normalizeRangeKey(key);
+      const normalizedValue = String(value || "").trim();
+      if (normalizedKey && normalizedValue) {
+        overrides[normalizedKey] = normalizedValue;
+      }
+    });
+  } catch (error) {
+    // Ignore invalid JSON overrides.
+  }
+
+  return overrides;
+}
+
+const CLUSTER_RANGE_OVERRIDES = parseClusterRanges(
+  BACKLOGS_CLUSTER_RANGES_JSON
+);
 
 function splitRow(line) {
   const raw = String(line || "");
@@ -416,7 +473,11 @@ function findHighestContributor(values) {
 }
 
 function getClusterRangeForRegion(region) {
-  const key = normalizeRegion(region);
+  const key = normalizeRangeKey(region);
+  const override = CLUSTER_RANGE_OVERRIDES[key];
+  if (override) {
+    return override;
+  }
   const ranges = {
     intersoc: "J33:K35",
     rc: "J58:K59",
@@ -524,9 +585,14 @@ async function handleBacklogsIntent(message, sheets, options = {}) {
     try {
       const tabName = BACKLOGS_TAB_NAME;
       const spreadsheetId = DATA_SHEET_ID;
+      const summaryRange = resolveTabRange(tabName, BACKLOGS_SUMMARY_RANGE);
+      const contributorsRange = resolveTabRange(
+        tabName,
+        BACKLOGS_CONTRIBUTORS_RANGE
+      );
       const summaryValues = await options.readSheetRange(
         spreadsheetId,
-        `${tabName}!J10:J11`
+        summaryRange || `${tabName}!J10:J11`
       );
       if (Array.isArray(summaryValues)) {
         refreshTs = summaryValues[0]?.[0] || refreshTs;
@@ -535,7 +601,7 @@ async function handleBacklogsIntent(message, sheets, options = {}) {
 
       const contributorsValues = await options.readSheetRange(
         spreadsheetId,
-        `${tabName}!I2:J8`
+        contributorsRange || `${tabName}!I2:J8`
       );
       if (Array.isArray(contributorsValues) && contributorsValues.length) {
         topContributor = findHighestContributor(contributorsValues);
@@ -546,7 +612,8 @@ async function handleBacklogsIntent(message, sheets, options = {}) {
         if (clusterRange) {
           const clusters = await options.readSheetRange(
             spreadsheetId,
-            `${tabName}!${clusterRange}`
+            resolveTabRange(tabName, clusterRange) ||
+              `${tabName}!${clusterRange}`
           );
           clusterLines = buildClusterLines(clusters);
         }
@@ -561,7 +628,7 @@ async function handleBacklogsIntent(message, sheets, options = {}) {
   }
 
   if (topContributor && !clusterLines.length && rows.length) {
-    const range = getClusterRangeForRegion(topContributor.region);
+    const range = stripTabPrefix(getClusterRangeForRegion(topContributor.region));
     const match = range.match(/J(\d+):K(\d+)/i);
     if (match) {
       const startRow = Number(match[1]);
@@ -800,7 +867,8 @@ async function handleTruckRequestIntent(message, sheets, options = {}) {
     try {
       const values = await options.readSheetRange(
         DATA_SHEET_ID,
-        `${TRUCK_TAB_NAME}!B3:K`
+        resolveTabRange(TRUCK_TAB_NAME, TRUCK_REQUEST_RANGE) ||
+          `${TRUCK_TAB_NAME}!B3:K`
       );
       entries = extractTruckRequestsFromRange(values);
     } catch (error) {

@@ -113,28 +113,100 @@ function createSheetsService(options = {}) {
     return response.data?.values || [];
   }
 
-  function parseSheetLink(line) {
+  function splitSheetLine(line) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith("#")) {
       return null;
     }
 
-    const idMatch = trimmed.match(/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+    let urlPart = trimmed;
+    let rangePart = "";
+    const pipeIndex = trimmed.indexOf("|");
+    if (pipeIndex >= 0) {
+      urlPart = trimmed.slice(0, pipeIndex).trim();
+      rangePart = trimmed.slice(pipeIndex + 1).trim();
+    } else {
+      const match = trimmed.match(/^(\S+)\s+(.+)$/);
+      if (match) {
+        urlPart = match[1].trim();
+        rangePart = match[2].trim();
+      }
+    }
+
+    if (!urlPart) {
+      return null;
+    }
+
+    return {
+      url: urlPart,
+      range: rangePart
+    };
+  }
+
+  function parseSheetLink(line) {
+    const parsed = splitSheetLine(line);
+    if (!parsed) {
+      return null;
+    }
+
+    const { url, range } = parsed;
+    const idMatch = url.match(/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
     if (!idMatch) {
       return null;
     }
 
-    const gidMatch = trimmed.match(/(?:[?#&]gid=)(\d+)/);
+    const gidMatch = url.match(/(?:[?#&]gid=)(\d+)/);
     return {
       id: idMatch[1],
       gid: gidMatch ? gidMatch[1] : null,
-      url: trimmed
+      url,
+      range: range || null
     };
   }
 
-  function buildSheetExportUrl(sheet) {
+  function stripTabFromRange(range) {
+    if (!range) {
+      return "";
+    }
+    const normalized = String(range).trim();
+    if (!normalized) {
+      return "";
+    }
+    const bangIndex = normalized.indexOf("!");
+    return bangIndex >= 0 ? normalized.slice(bangIndex + 1) : normalized;
+  }
+
+  function resolveRangeForTab(sheetRange, tabTitle) {
+    const effectiveRange = sheetRange || defaultRange;
+    if (!effectiveRange) {
+      return tabTitle || "";
+    }
+
+    const normalized = String(effectiveRange).trim();
+    if (!normalized) {
+      return tabTitle || "";
+    }
+
+    const hasTabName = normalized.includes("!");
+    if (hasTabName) {
+      if (scanAllTabs && tabTitle) {
+        const stripped = stripTabFromRange(normalized);
+        return stripped ? `${tabTitle}!${stripped}` : tabTitle;
+      }
+      return normalized;
+    }
+
+    return tabTitle ? `${tabTitle}!${normalized}` : normalized;
+  }
+
+  function resolveCsvRange(sheetRange) {
+    return stripTabFromRange(sheetRange || defaultRange);
+  }
+
+  function buildSheetExportUrl(sheet, range) {
     const gidParam = sheet.gid ? `&gid=${sheet.gid}` : "";
-    return `https://docs.google.com/spreadsheets/d/${sheet.id}/export?format=csv${gidParam}`;
+    const rangeParam = range ? `&range=${encodeURIComponent(range)}` : "";
+    return `https://docs.google.com/spreadsheets/d/${sheet.id}/export?format=csv${gidParam}${rangeParam}`;
   }
 
   function buildSheetUrlWithGid(spreadsheetId, sheetId) {
@@ -170,7 +242,7 @@ function createSheetsService(options = {}) {
         throw new Error("Unable to determine sheet name.");
       }
 
-      const range = defaultRange ? `${sheetTitle}!${defaultRange}` : sheetTitle;
+      const range = resolveRangeForTab(sheet.range, sheetTitle);
       const valuesResponse = await api.spreadsheets.values.get({
         spreadsheetId: sheet.id,
         range
@@ -196,7 +268,7 @@ function createSheetsService(options = {}) {
         throw new Error("Unable to determine sheet name.");
       }
 
-      const range = defaultRange ? `${sheetTitle}!${defaultRange}` : sheetTitle;
+      const range = resolveRangeForTab(sheet.range, sheetTitle);
       const valuesResponse = await api.spreadsheets.values.get({
         spreadsheetId: sheet.id,
         range
@@ -216,10 +288,9 @@ function createSheetsService(options = {}) {
     }
 
     const tabs = sheets.slice(0, maxTabs || sheets.length);
-    const ranges = tabs.map((entry) => {
-      const title = entry.properties?.title;
-      return defaultRange ? `${title}!${defaultRange}` : title;
-    });
+    const ranges = tabs.map((entry) =>
+      resolveRangeForTab(sheet.range, entry.properties?.title)
+    );
 
     const valuesResponse = await api.spreadsheets.values.batchGet({
       spreadsheetId: sheet.id,
@@ -242,7 +313,8 @@ function createSheetsService(options = {}) {
   }
 
   async function fetchSheetCsv(sheet) {
-    const exportUrl = buildSheetExportUrl(sheet);
+    const range = resolveCsvRange(sheet.range || defaultRange);
+    const exportUrl = buildSheetExportUrl(sheet, range);
     const response = await axios.get(exportUrl, {
       responseType: "text",
       timeout: httpTimeoutMs

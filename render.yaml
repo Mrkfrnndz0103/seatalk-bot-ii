@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: seatalk-bot
+    env: node
+    plan: starter
+    buildCommand: npm install
+    startCommand: npm start
+    autoDeploy: true
+    disk:
+      name: data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: LOG_LEVEL
+        value: info
+      - key: INDEX_STORE_PATH
+        value: /data/chunks.jsonl
+      - key: TRUCK_ALERT_STATE_PATH
+        value: /data/truck-alert-state.json
+      - key: SIGNING_SECRET
+        sync: false
+      - key: BOT_ACCESS_TOKEN
+        sync: false
+      - key: SEATALK_APP_ID
+        sync: false
+      - key: SEATALK_APP_SECRET
+        sync: false
+      - key: SEATALK_TOKEN_URL
+        sync: false

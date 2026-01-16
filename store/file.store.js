@@ -1,4 +1,5 @@
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const { tokenize } = require("../utils/text");
 const { logger } = require("../utils/logger");
@@ -13,18 +14,52 @@ class FileStore {
     this.filePath = path.resolve(filePath);
     this.items = [];
     this.invertedIndex = new Map();
+    this.enabled = true;
+    this.allowTempFallback =
+      typeof options.allowTempFallback === "boolean"
+        ? options.allowTempFallback
+        : Boolean(process.env.VERCEL || process.env.VERCEL_ENV);
     this.ensureDirectory();
   }
 
   ensureDirectory() {
+    if (!this.enabled) {
+      return false;
+    }
     const dir = path.dirname(this.filePath);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
+    try {
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
+      return true;
+    } catch (error) {
+      if (this.allowTempFallback) {
+        const tmpPath = path.join(os.tmpdir(), path.basename(this.filePath));
+        if (tmpPath !== this.filePath) {
+          logger.warn("filestore_tmp_fallback", {
+            from: this.filePath,
+            to: tmpPath,
+            error: error.message
+          });
+          this.filePath = tmpPath;
+          return this.ensureDirectory();
+        }
+      }
+      logger.error("filestore_directory_failed", {
+        dir,
+        error: error.message
+      });
+      this.enabled = false;
+      return false;
     }
   }
 
   load() {
-    this.ensureDirectory();
+    if (!this.ensureDirectory()) {
+      this.items = [];
+      this.invertedIndex = new Map();
+      return this.items;
+    }
 
     if (!fs.existsSync(this.filePath)) {
       this.items = [];
@@ -54,7 +89,11 @@ class FileStore {
   }
 
   clear() {
-    this.ensureDirectory();
+    if (!this.ensureDirectory()) {
+      this.items = [];
+      this.invertedIndex = new Map();
+      return;
+    }
     fs.writeFileSync(this.filePath, "");
     this.items = [];
     this.invertedIndex = new Map();
@@ -65,9 +104,11 @@ class FileStore {
       throw new Error("upsertChunks expects an array.");
     }
 
-    this.ensureDirectory();
     this.items = chunks;
     this.buildIndex(chunks);
+    if (!this.ensureDirectory()) {
+      return this.items;
+    }
 
     const payload = chunks.map((chunk) => JSON.stringify(chunk)).join("\n");
     fs.writeFileSync(this.filePath, payload ? `${payload}\n` : "");
